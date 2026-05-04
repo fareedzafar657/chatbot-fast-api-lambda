@@ -303,3 +303,83 @@ async def patch_message(msg_id: str, user_id: str, state: str | None, content: s
 async def delete_message(msg_id: str, user_id: str):
     """Soft delete — sets state to deleted, preserves the record."""
     await patch_message(msg_id, user_id, state="deleted", content=None)
+
+
+# ─── Usage Stats ─────────────────────────────────────────────────────────────
+
+async def get_usage_stats(user_id: str) -> dict:
+    """Aggregate token usage for a user across all messages."""
+    table = get_table(settings.dynamo_messages_table)
+
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_messages = 0
+    daily: dict[str, dict] = {}
+    model_tokens: dict[str, int] = {}
+
+    kwargs = {
+        "IndexName": "userId-createdAt-index",
+        "KeyConditionExpression": Key("userId").eq(user_id),
+        "FilterExpression": "#role = :assistant",
+        "ExpressionAttributeNames": {"#role": "role"},
+        "ExpressionAttributeValues": {":assistant": "assistant"},
+    }
+
+    while True:
+        response = table.query(**kwargs)
+        for item in response.get("Items", []):
+            input_tokens  = int(item.get("inputTokens")  or 0)
+            output_tokens = int(item.get("outputTokens") or 0)
+            model_id      = item.get("modelId", "amazon.nova-micro-v1:0")
+            created_at    = item.get("createdAt", "")
+            date_str      = created_at[:10] if len(created_at) >= 10 else "unknown"
+
+            total_input_tokens  += input_tokens
+            total_output_tokens += output_tokens
+            total_messages      += 1
+
+            if date_str not in daily:
+                daily[date_str] = {"inputTokens": 0, "outputTokens": 0, "messageCount": 0}
+            daily[date_str]["inputTokens"]  += input_tokens
+            daily[date_str]["outputTokens"] += output_tokens
+            daily[date_str]["messageCount"] += 1
+
+            model_tokens[model_id] = model_tokens.get(model_id, 0) + input_tokens + output_tokens
+
+        if "LastEvaluatedKey" not in response:
+            break
+        kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+    total_tokens = total_input_tokens + total_output_tokens
+    estimated_cost = (total_input_tokens / 1000) * 0.000035 + (total_output_tokens / 1000) * 0.000035
+
+    daily_usage = [
+        {
+            "date": date,
+            "inputTokens": v["inputTokens"],
+            "outputTokens": v["outputTokens"],
+            "messageCount": v["messageCount"],
+        }
+        for date, v in sorted(daily.items())
+        if date != "unknown"
+    ]
+
+    grand_total = total_tokens or 1  # avoid division by zero
+    model_breakdown = [
+        {
+            "modelId": mid,
+            "tokenCount": count,
+            "percentage": round(count / grand_total * 100),
+        }
+        for mid, count in sorted(model_tokens.items(), key=lambda x: -x[1])
+    ]
+
+    return {
+        "total_messages":       total_messages,
+        "total_input_tokens":   total_input_tokens,
+        "total_output_tokens":  total_output_tokens,
+        "total_tokens":         total_tokens,
+        "estimated_cost_usd":   round(estimated_cost, 6),
+        "daily_usage":          daily_usage,
+        "model_breakdown":      model_breakdown,
+    }

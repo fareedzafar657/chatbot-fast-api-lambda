@@ -1,0 +1,234 @@
+# .github/workflows/deploy.yml
+#
+# ─── HOW THIS DIFFERS FROM THE STREAMING LAMBDA PIPELINE ─────────────────────
+# The streaming Lambda is Node.js — we use npm ci + zip.
+# This Lambda is Python — we use pip install + zip.
+#
+# The key challenge with Python Lambdas is that some packages (like pydantic)
+# have compiled C extensions that must be built for the Lambda Linux environment.
+# We solve this by using --platform manylinux2014_x86_64 when installing,
+# which downloads the Linux-compatible pre-built wheels regardless of what
+# OS the GitHub runner is using.
+#
+# ─── WHAT THIS PIPELINE DOES ─────────────────────────────────────────────────
+# 1. Triggered on push to dev or main
+# 2. test job  → validates Python syntax, checks required files exist
+# 3. deploy job → installs deps for Linux, zips correctly, uploads to Lambda
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Deploy FastAPI Lambda
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  LAMBDA_FUNCTION_NAME: fast-api-lambda
+  PYTHON_VERSION: '3.12'
+
+jobs:
+
+  # ── JOB 1: TEST ─────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Set up the same Python version as the Lambda runtime
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          # Cache pip downloads between runs — speeds up subsequent deploys
+          cache: 'pip'
+
+      # Install dependencies for testing
+      # We install normally here (not with --platform flag) because
+      # the test job runs on the GitHub Ubuntu runner, not Lambda Linux
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Check Python syntax across all files
+      # py_compile checks for syntax errors without running the code
+      - name: Check Python syntax
+        run: |
+          echo "Checking Python syntax..."
+          find app -name "*.py" -exec python -m py_compile {} \;
+          python -m py_compile lambda_handler.py
+          echo "Syntax check passed ✓"
+
+      # Validate that all required files and folders exist
+      - name: Validate structure
+        run: |
+          echo "Checking required files..."
+          test -f lambda_handler.py          || (echo "Missing lambda_handler.py" && exit 1)
+          test -f requirements.txt           || (echo "Missing requirements.txt" && exit 1)
+          test -f app/main.py                || (echo "Missing app/main.py" && exit 1)
+          test -f app/config.py              || (echo "Missing app/config.py" && exit 1)
+          test -d app/routers                || (echo "Missing app/routers/" && exit 1)
+          test -d app/services               || (echo "Missing app/services/" && exit 1)
+          test -d app/middleware             || (echo "Missing app/middleware/" && exit 1)
+          echo "All required files present ✓"
+
+      # Import check — verifies FastAPI app loads without errors
+      # This catches missing imports, config errors, syntax issues in dependencies
+      - name: Import check
+        run: |
+          echo "Checking app imports..."
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          try:
+              from app.main import app
+              print('App imports successfully ✓')
+          except Exception as e:
+              print(f'Import failed: {e}')
+              sys.exit(1)
+          "
+
+  # ── JOB 2: DEPLOY ───────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to AWS Lambda
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      # ── THE MOST IMPORTANT STEP FOR PYTHON LAMBDAS ──────────────────────────
+      # Install packages into a local .deps/ folder using --platform flags.
+      #
+      # Why --platform manylinux2014_x86_64?
+      # Lambda runs on Amazon Linux (x86_64). Pydantic has compiled C extensions.
+      # If you install normally on a Mac or Windows runner, you get the wrong
+      # binary format and Lambda crashes with "No module named pydantic_core".
+      # --platform forces pip to download the Linux x86_64 wheels instead.
+      #
+      # Why --only-binary=:all:?
+      # This tells pip to never compile from source — only use pre-built wheels.
+      # Combined with --platform, this guarantees we get Linux-compatible binaries.
+      #
+      # Why --target .deps/?
+      # Instead of installing into the system Python, we install into a local
+      # folder that we can then include in the zip at the right location.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Install dependencies for Lambda Linux environment
+        run: |
+          echo "Installing packages for Lambda Linux (x86_64)..."
+          pip install \
+            --target .deps/ \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version ${{ env.PYTHON_VERSION }} \
+            --only-binary=:all: \
+            --upgrade \
+            -r requirements.txt
+          echo "Dependencies installed ✓"
+
+      # Create the zip with correct structure:
+      # Lambda expects all imports to be resolvable from the zip root.
+      # So the zip must contain:
+      #   lambda_handler.py   ← at root (Lambda entry point)
+      #   app/                ← at root (our FastAPI app)
+      #   fastapi/            ← at root (from .deps/)
+      #   pydantic/           ← at root (from .deps/)
+      #   ... other packages  ← at root (from .deps/)
+      #
+      # We achieve this by:
+      # 1. Starting inside .deps/ and adding everything (the packages)
+      # 2. Going back to root and adding lambda_handler.py and app/
+      - name: Create deployment zip
+        run: |
+          echo "Creating deployment package..."
+
+          # Step 1: zip all installed packages from inside .deps/
+          cd .deps
+          zip -r ../function.zip . -q
+          cd ..
+
+          # Step 2: add our app code to the same zip
+          zip -r function.zip app/ lambda_handler.py requirements.txt -q
+
+          echo "Zip size: $(du -sh function.zip | cut -f1)"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Lambda
+        run: |
+          echo "Deploying to Lambda: ${{ env.LAMBDA_FUNCTION_NAME }}..."
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --zip-file fileb://function.zip \
+            --region ${{ env.AWS_REGION }}
+          echo "Deploy complete ✓"
+
+      - name: Wait for Lambda update
+        run: |
+          echo "Waiting for Lambda to be ready..."
+          aws lambda wait function-updated \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --region ${{ env.AWS_REGION }}
+          echo "Lambda is ready ✓"
+
+      - name: Smoke test — health endpoint
+        run: |
+          echo "Running smoke test..."
+          # Get the Function URL from Lambda config
+          FUNCTION_URL=$(aws lambda get-function-url-config \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'FunctionUrl' \
+            --output text)
+
+          echo "Function URL: $FUNCTION_URL"
+
+          # Hit the /health endpoint — no auth required
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${FUNCTION_URL}health")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Health check passed (HTTP $HTTP_STATUS) ✓"
+          else
+            echo "Health check failed (HTTP $HTTP_STATUS) ✗"
+            exit 1
+          fi
+
+      - name: Verify deployment
+        run: |
+          aws lambda get-function-configuration \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query '{Handler:Handler,Runtime:Runtime,CodeSize:CodeSize,LastModified:LastModified}' \
+            --output table
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Summary 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Function | ${{ env.LAMBDA_FUNCTION_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY

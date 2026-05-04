@@ -10,6 +10,14 @@ router = APIRouter(prefix="/sessions", tags=["Sessions"])
 settings = get_settings()
 
 
+@router.get("/usage/stats")
+async def get_usage_stats(
+    user: dict = Depends(get_current_user),
+):
+    """Return aggregated token usage for the current user."""
+    return await db.get_usage_stats(user["sub"])
+
+
 @router.get("", response_model=PaginatedSessions)
 async def list_sessions(
     page_size: int = Query(default=20, ge=1, le=100),
