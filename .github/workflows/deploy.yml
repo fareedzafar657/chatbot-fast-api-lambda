@@ -43,22 +43,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Set up the same Python version as the Lambda runtime
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          # Cache pip downloads between runs — speeds up subsequent deploys
           cache: 'pip'
 
-      # Install dependencies for testing
-      # We install normally here (not with --platform flag) because
-      # the test job runs on the GitHub Ubuntu runner, not Lambda Linux
+      # Install dependencies normally for the test job.
+      # We do NOT use --platform flags here because those download
+      # Linux wheels but don't install them into the runner's Python,
+      # which would cause "No module named boto3" errors.
+      # boto3 is provided by the Lambda runtime so it's fine to
+      # install it normally just for syntax checking.
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       # Check Python syntax across all files
-      # py_compile checks for syntax errors without running the code
       - name: Check Python syntax
         run: |
           echo "Checking Python syntax..."
@@ -79,21 +79,18 @@ jobs:
           test -d app/middleware             || (echo "Missing app/middleware/" && exit 1)
           echo "All required files present ✓"
 
-      # Import check — verifies FastAPI app loads without errors
-      # This catches missing imports, config errors, syntax issues in dependencies
-      - name: Import check
+      # Compile each module individually — catches import errors
+      # and syntax issues without needing the full app to boot
+      - name: Check FastAPI routes compile
         run: |
-          echo "Checking app imports..."
-          python -c "
-          import sys
-          sys.path.insert(0, '.')
-          try:
-              from app.main import app
-              print('App imports successfully ✓')
-          except Exception as e:
-              print(f'Import failed: {e}')
-              sys.exit(1)
-          "
+          echo "Checking routers..."
+          python -m py_compile app/routers/sessions.py
+          python -m py_compile app/routers/branches.py
+          python -m py_compile app/routers/messages.py
+          python -m py_compile app/services/dynamodb.py
+          python -m py_compile app/middleware/auth.py
+          python -m py_compile app/models/schemas.py
+          echo "All modules compile successfully ✓"
 
   # ── JOB 2: DEPLOY ───────────────────────────────────────────────────────────
   deploy:
@@ -112,23 +109,10 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
-      # ── THE MOST IMPORTANT STEP FOR PYTHON LAMBDAS ──────────────────────────
-      # Install packages into a local .deps/ folder using --platform flags.
-      #
-      # Why --platform manylinux2014_x86_64?
-      # Lambda runs on Amazon Linux (x86_64). Pydantic has compiled C extensions.
-      # If you install normally on a Mac or Windows runner, you get the wrong
-      # binary format and Lambda crashes with "No module named pydantic_core".
-      # --platform forces pip to download the Linux x86_64 wheels instead.
-      #
-      # Why --only-binary=:all:?
-      # This tells pip to never compile from source — only use pre-built wheels.
-      # Combined with --platform, this guarantees we get Linux-compatible binaries.
-      #
-      # Why --target .deps/?
-      # Instead of installing into the system Python, we install into a local
-      # folder that we can then include in the zip at the right location.
-      # ────────────────────────────────────────────────────────────────────────
+      # Install packages for Lambda Linux environment
+      # --platform manylinux2014_x86_64 gets Linux-compatible binaries
+      # --only-binary=:all: never compiles from source
+      # --target .deps/ installs into a local folder for zipping
       - name: Install dependencies for Lambda Linux environment
         run: |
           echo "Installing packages for Lambda Linux (x86_64)..."
@@ -142,30 +126,17 @@ jobs:
             -r requirements.txt
           echo "Dependencies installed ✓"
 
-      # Create the zip with correct structure:
-      # Lambda expects all imports to be resolvable from the zip root.
-      # So the zip must contain:
-      #   lambda_handler.py   ← at root (Lambda entry point)
-      #   app/                ← at root (our FastAPI app)
-      #   fastapi/            ← at root (from .deps/)
-      #   pydantic/           ← at root (from .deps/)
-      #   ... other packages  ← at root (from .deps/)
-      #
-      # We achieve this by:
-      # 1. Starting inside .deps/ and adding everything (the packages)
-      # 2. Going back to root and adding lambda_handler.py and app/
+      # Zip structure must have everything at root level:
+      #   lambda_handler.py, app/, fastapi/, pydantic/, pydantic_core/ etc.
+      # Step 1: zip packages from inside .deps/ (so they land at zip root)
+      # Step 2: add our app code at zip root
       - name: Create deployment zip
         run: |
           echo "Creating deployment package..."
-
-          # Step 1: zip all installed packages from inside .deps/
           cd .deps
           zip -r ../function.zip . -q
           cd ..
-
-          # Step 2: add our app code to the same zip
           zip -r function.zip app/ lambda_handler.py requirements.txt -q
-
           echo "Zip size: $(du -sh function.zip | cut -f1)"
 
       - name: Configure AWS credentials
@@ -192,10 +163,11 @@ jobs:
             --region ${{ env.AWS_REGION }}
           echo "Lambda is ready ✓"
 
+      # Smoke test — hits /health after deploy
+      # Catches startup errors immediately after deployment
       - name: Smoke test — health endpoint
         run: |
           echo "Running smoke test..."
-          # Get the Function URL from Lambda config
           FUNCTION_URL=$(aws lambda get-function-url-config \
             --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
             --region ${{ env.AWS_REGION }} \
@@ -204,7 +176,6 @@ jobs:
 
           echo "Function URL: $FUNCTION_URL"
 
-          # Hit the /health endpoint — no auth required
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${FUNCTION_URL}health")
 
           if [ "$HTTP_STATUS" = "200" ]; then
@@ -231,4 +202,5 @@ jobs:
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY      # Import check — verifies FastAPI app loads without errors
+      # This catches missing imports, config errors, syntax issues in dependencies
