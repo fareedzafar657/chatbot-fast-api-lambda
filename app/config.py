@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     cognito_region: str = "us-east-1"
 
     # CORS — set to your frontend domain in production
-    cors_origins: str = "http://localhost:3000"  # comma-separated list
+    cors_origins: str = "http://localhost:3000, http://52.6.73.220"  # comma-separated list
 
     # Pagination
     default_page_size: int = 20

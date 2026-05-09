@@ -196,13 +196,47 @@ async def fork_branch(user_id: str, data: dict) -> dict:
     # Verify session ownership
     await get_session(data["session_id"], user_id)
 
+    # Validate: first selected message must be from user
+    selected_msg_ids = data.get("selected_msg_ids", [])
+    if selected_msg_ids:
+        first_msg_id = selected_msg_ids[0]
+        first_msg = await get_message(first_msg_id, user_id)
+        if first_msg["role"] != "user":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="First message in branch must be from user"
+            )
+
     branch_id = f"branch_{uuid4()}"
+
+    # Duplicate selected messages into the new branch with new IDs
+    messages_table = get_table(settings.dynamo_messages_table)
+    new_msg_ids = []
+    for msg_id in selected_msg_ids:
+        try:
+            response = messages_table.get_item(Key={"msgId": msg_id})
+            if "Item" in response:
+                original_msg = response["Item"]
+                new_msg_id = f"msg_{uuid4()}"
+                # Create a copy with new msgId and new branchId
+                duplicated_msg = {
+                    **original_msg,
+                    "msgId": new_msg_id,
+                    "branchId": branch_id,
+                    "createdAt": now_iso(),
+                }
+                messages_table.put_item(Item=duplicated_msg)
+                new_msg_ids.append(new_msg_id)
+        except ClientError:
+            pass  # skip if message not found
+
+    # Create the branch with the new message IDs
     item = {
         "branchId":       branch_id,
         "sessionId":      data["session_id"],
         "parentBranchId": data["parent_branch_id"],
         "parentMsgId":    data.get("parent_msg_id"),
-        "selectedMsgIds": data["selected_msg_ids"],
+        "selectedMsgIds": new_msg_ids,
         "label":          data.get("label") or f"fork-{int(datetime.now().timestamp())}",
         "createdAt":      now_iso(),
     }
