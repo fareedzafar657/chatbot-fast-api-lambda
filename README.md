@@ -22,6 +22,75 @@ app/
     dynamodb.py            ← All DynamoDB reads/writes
 ```
 
+## Local Development
+
+### Prerequisites
+- **Docker** — for SAM to build and run your Lambda locally
+- **SAM CLI** — `pip install aws-sam-cli`
+- **Python 3.12+** — (Docker runs this, not required locally)
+
+### Setup
+
+#### 1. Download SAM template from AWS Lambda
+In AWS Lambda console, download the SAM template (YAML file) for your function.
+
+#### 2. Organize code to match template
+The downloaded YAML expects code in a `src/` directory. Restructure your project:
+```bash
+mkdir -p src
+mv app src/
+mv lambda_handler.py src/
+mv requirements.txt src/
+```
+
+Result:
+```
+fast-api-lambda/
+├── template.yml
+└── src/
+    ├── lambda_handler.py
+    ├── requirements.txt
+    └── app/
+        ├── main.py
+        ├── config.py
+        └── ...
+```
+
+#### 3. Add API Gateway for local testing (optional)
+To test locally with `sam local start-api` (HTTP server), modify your `template.yml` to match [template.example.yml](./template.example.yml).
+
+**Key changes from downloaded template:**
+1. Added `ChatbotApi` resource (API Gateway)
+2. Added `Events` section in `fastapilambda` to connect Lambda to API
+3. Changed `CodeUri` from `./src` — adjust if your code is elsewhere
+
+### Run Locally
+
+#### Build
+```bash
+sam build --use-container
+```
+
+#### Start API server
+```bash
+sam local start-api --port 8000
+```
+
+Your API is now running at `http://localhost:3000`
+
+#### Test endpoints
+```bash
+curl http://localhost:8000/health
+
+# View interactive docs
+open http://localhost:8000/docs
+```
+
+#### Or use `sam local invoke` (without HTTP server)
+```bash
+sam local invoke fastapilambda -e events/event.json
+```
+
 ## Environment variables
 
 | Variable                  | Required | Default                  | Description                        |
@@ -37,49 +106,6 @@ app/
 | `DEFAULT_PAGE_SIZE`       | no       | `20`                     | Default pagination size            |
 | `MAX_PAGE_SIZE`           | no       | `100`                    | Max pagination size                |
 
-## Deploy steps
-
-### 1. Package and deploy
-```bash
-bash deploy.sh chatbot-api us-east-1
-```
-
-### 2. Create Lambda (first time only)
-```bash
-aws lambda create-function \
-  --function-name chatbot-api \
-  --runtime python3.12 \
-  --role arn:aws:iam::YOUR_ACCOUNT:role/chatbot-lambda-role \
-  --handler lambda_handler.handler \
-  --zip-file fileb://function.zip \
-  --timeout 30 \
-  --memory-size 256 \
-  --environment "Variables={
-    COGNITO_USER_POOL_ID=us-east-1_XXXXXXXX,
-    COGNITO_CLIENT_ID=XXXXXXXXXX,
-    CORS_ORIGINS=https://yourapp.com
-  }" \
-  --region us-east-1
-```
-
-### 3. Create Function URL (BUFFERED mode — NOT streaming)
-```bash
-aws lambda create-function-url-config \
-  --function-name chatbot-api \
-  --auth-type NONE \
-  --invoke-mode BUFFERED
-
-aws lambda add-permission \
-  --function-name chatbot-api \
-  --statement-id FunctionURLAllowPublicAccess \
-  --action lambda:InvokeFunctionUrl \
-  --principal "*" \
-  --function-url-auth-type NONE
-```
-
-### 4. Attach DynamoDB policy
-Same policy as the streaming Lambda — attach `infra/lambda-iam-policy.json`
-from the streaming Lambda project to this Lambda's role as well.
 
 ## API Reference
 

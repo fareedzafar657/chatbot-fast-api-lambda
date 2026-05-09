@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: An AWS Serverless Application Model (SAM) template describing your function.
+
+Resources:
+  ChatbotApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+      Cors:
+        AllowMethods: "'GET, POST, PUT, DELETE, PATCH, OPTIONS'"
+        AllowHeaders: "'Content-Type, Authorization'"
+        AllowOrigin: "'*'"
+
+  fastapilambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures:
+        - x86_64
+      CodeUri: ./src
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatbotApi
+            Path: /{proxy+}
+            Method: ANY
+      Description: ''
+      Environment:
+        Variables:
+          DYNAMO_SESSIONS_TABLE: chatbot_sessions
+          DYNAMO_MESSAGES_TABLE: chatbot_messages
+          COGNITO_REGION: us-east-1
+          CORS_ORIGINS: http://localhost:3000
+          DYNAMO_BRANCHES_TABLE: chatbot_branches
+          COGNITO_CLIENT_ID: YOUR_COGNITO_CLIENT_ID
+          COGNITO_USER_POOL_ID: YOUR_COGNITO_USER_POOL_ID
+      EphemeralStorage:
+        Size: 512
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowCredentials: false
+          AllowHeaders:
+            - '*'
+          AllowMethods:
+            - '*'
+          AllowOrigins:
+            - '*'
+          ExposeHeaders:
+            - '*'
+          MaxAge: 0
+        InvokeMode: BUFFERED
+      Handler: lambda_handler.handler
+      Layers:
+        - arn:aws:lambda:REGION:ACCOUNT:layer:LAYER_NAME:VERSION
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: /aws/lambda/FUNCTION_NAME
+      MemorySize: 256
+      PackageType: Zip
+      RecursiveLoop: Terminate
+      Runtime: python3.12
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: Auto
+      SnapStart:
+        ApplyOn: None
+      Tags: {}
+      Timeout: 60
+      Tracing: PassThrough
+      Role: >-
+        arn:aws:iam::ACCOUNT:role/service-role/ROLE_NAME
