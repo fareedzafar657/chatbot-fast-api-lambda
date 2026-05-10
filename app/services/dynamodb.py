@@ -6,7 +6,7 @@ from botocore.exceptions import ClientError
 from uuid import uuid4
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
-from app.config import get_settings
+from app.config import get_settings, DYNAMO_SESSIONS_TABLE, DYNAMO_BRANCHES_TABLE, DYNAMO_MESSAGES_TABLE
 
 settings = get_settings()
 
@@ -89,7 +89,7 @@ def db_to_session(item: dict) -> dict:
 # ─── Sessions ────────────────────────────────────────────────────────────────
 
 async def list_sessions(user_id: str, page_size: int, cursor: str | None) -> dict:
-    table = get_table(settings.dynamo_sessions_table)
+    table = get_table(DYNAMO_SESSIONS_TABLE)
 
     kwargs = {
         "IndexName": "userId-updatedAt-index",
@@ -119,7 +119,7 @@ async def list_sessions(user_id: str, page_size: int, cursor: str | None) -> dic
 
 
 async def get_session(session_id: str, user_id: str) -> dict:
-    table = get_table(settings.dynamo_sessions_table)
+    table = get_table(DYNAMO_SESSIONS_TABLE)
     response = table.get_item(Key={"sessionId": session_id})
     item = response.get("Item")
 
@@ -135,7 +135,7 @@ async def update_session(session_id: str, user_id: str, updates: dict) -> dict:
     # Verify ownership first
     await get_session(session_id, user_id)
 
-    table = get_table(settings.dynamo_sessions_table)
+    table = get_table(DYNAMO_SESSIONS_TABLE)
     expressions = ["updatedAt = :now"]
     values = {":now": now_iso()}
     names = {}
@@ -164,7 +164,7 @@ async def update_session(session_id: str, user_id: str, updates: dict) -> dict:
 
 async def delete_session(session_id: str, user_id: str):
     await get_session(session_id, user_id)
-    table = get_table(settings.dynamo_sessions_table)
+    table = get_table(DYNAMO_SESSIONS_TABLE)
     table.delete_item(Key={"sessionId": session_id})
 
 
@@ -174,7 +174,7 @@ async def list_branches(session_id: str, user_id: str) -> list[dict]:
     # Verify session ownership
     await get_session(session_id, user_id)
 
-    table = get_table(settings.dynamo_branches_table)
+    table = get_table(DYNAMO_BRANCHES_TABLE)
     response = table.query(
         IndexName="sessionId-createdAt-index",
         KeyConditionExpression=Key("sessionId").eq(session_id),
@@ -184,7 +184,7 @@ async def list_branches(session_id: str, user_id: str) -> list[dict]:
 
 
 async def get_branch(branch_id: str) -> dict:
-    table = get_table(settings.dynamo_branches_table)
+    table = get_table(DYNAMO_BRANCHES_TABLE)
     response = table.get_item(Key={"branchId": branch_id})
     item = response.get("Item")
     if not item:
@@ -210,7 +210,7 @@ async def fork_branch(user_id: str, data: dict) -> dict:
     branch_id = f"branch_{uuid4()}"
 
     # Duplicate selected messages into the new branch with new IDs
-    messages_table = get_table(settings.dynamo_messages_table)
+    messages_table = get_table(DYNAMO_MESSAGES_TABLE)
     new_msg_ids = []
     for msg_id in selected_msg_ids:
         try:
@@ -241,7 +241,7 @@ async def fork_branch(user_id: str, data: dict) -> dict:
         "createdAt":      now_iso(),
     }
 
-    table = get_table(settings.dynamo_branches_table)
+    table = get_table(DYNAMO_BRANCHES_TABLE)
     table.put_item(Item=item)
     return db_to_branch(item)
 
@@ -259,7 +259,7 @@ async def list_messages(
     branch = await get_branch(branch_id)
     await get_session(branch["session_id"], user_id)
 
-    table = get_table(settings.dynamo_messages_table)
+    table = get_table(DYNAMO_MESSAGES_TABLE)
 
     kwargs = {
         "IndexName": "branchId-createdAt-index",
@@ -294,7 +294,7 @@ async def list_messages(
 
 
 async def get_message(msg_id: str, user_id: str) -> dict:
-    table = get_table(settings.dynamo_messages_table)
+    table = get_table(DYNAMO_MESSAGES_TABLE)
     response = table.get_item(Key={"msgId": msg_id})
     item = response.get("Item")
 
@@ -310,7 +310,7 @@ async def patch_message(msg_id: str, user_id: str, state: str | None, content: s
     # Verify ownership
     await get_message(msg_id, user_id)
 
-    table = get_table(settings.dynamo_messages_table)
+    table = get_table(DYNAMO_MESSAGES_TABLE)
     expressions = ["#st = :state", "updatedAt = :now"]
     names  = {"#st": "state"}
     values = {":now": now_iso()}
@@ -343,7 +343,7 @@ async def delete_message(msg_id: str, user_id: str):
 
 async def get_usage_stats(user_id: str) -> dict:
     """Aggregate token usage for a user across all messages."""
-    table = get_table(settings.dynamo_messages_table)
+    table = get_table(DYNAMO_MESSAGES_TABLE)
 
     total_input_tokens = 0
     total_output_tokens = 0

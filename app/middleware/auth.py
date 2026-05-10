@@ -4,7 +4,6 @@ from jose import jwt, JWTError
 from jose.exceptions import ExpiredSignatureError
 import httpx
 import time
-from functools import lru_cache
 from app.config import get_settings
 
 bearer_scheme = HTTPBearer()

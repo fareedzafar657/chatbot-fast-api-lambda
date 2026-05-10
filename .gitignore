@@ -2,3 +2,6 @@
 .aws-sam
 events
 template.yml
+.claude
+*graphify*
+*__pycache__*

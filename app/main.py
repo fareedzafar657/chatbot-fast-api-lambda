@@ -1,3 +1,5 @@
+import logging
+import time
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,15 +9,14 @@ from app.config import get_settings
 from app.routers import sessions, branches, messages
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Chatbot Management API",
-    description="REST API for managing chat sessions, branches, and messages.",
+    title="Chatbot API",
+    description="REST API for managing chat sessions, branches, and messages etc.",
     version="1.0.0",
-    # Disable docs in production if needed:
-    # docs_url=None, redoc_url=None
 )
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
@@ -27,6 +28,24 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+# ─── Request Logging ──────────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
+
+    logger.info(
+        f"{request.method} {request.url.path}",
+        extra={
+            "status_code": response.status_code,
+            "duration_ms": round(duration * 1000),
+            "client_ip": request.client.host if request.client else "unknown",
+        }
+    )
+    return response
 
 # ─── Routers ─────────────────────────────────────────────────────────────────
 
@@ -45,15 +64,25 @@ async def health():
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    # Log the full exception internally (visible in CloudWatch)
+    logger.error(
+        "Unhandled exception",
+        exc_info=True,
+        extra={
+            "path": request.url.path,
+            "method": request.method,
+            "client": request.client.host if request.client else "unknown",
+        }
+    )
+
+    # Return generic message to client (no sensitive details leaked)
     return JSONResponse(
         status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)},
+        content={"error": "Internal server error"},
     )
 
 
 # ─── Lambda handler ───────────────────────────────────────────────────────────
 # Mangum wraps FastAPI to work as a Lambda Function URL handler.
-# IMPORTANT: Function URL must be in BUFFERED mode (not RESPONSE_STREAM)
-# since this is a regular REST API, not a streaming endpoint.
 
 handler = Mangum(app, lifespan="off")
