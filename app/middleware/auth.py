@@ -71,14 +71,24 @@ async def get_current_user(
         jwks = await _get_jwks(settings.cognito_jwks_url)
         public_key = _get_public_key(token, jwks)
 
+        # Decode without audience verification — Cognito access tokens use
+        # `client_id` instead of `aud`, so PyJWT's built-in aud check fails.
+        # We verify the client manually below based on token_use.
         payload = jwt.decode(
             token,
             public_key,
             algorithms=["RS256"],
-            audience=settings.cognito_client_id,
+            options={"verify_aud": False},
         )
 
-        if payload.get("token_use") not in ("access", "id"):
+        token_use = payload.get("token_use")
+        if token_use == "access":
+            if payload.get("client_id") != settings.cognito_client_id:
+                raise credentials_exception
+        elif token_use == "id":
+            if payload.get("aud") != settings.cognito_client_id:
+                raise credentials_exception
+        else:
             raise credentials_exception
 
         return payload
