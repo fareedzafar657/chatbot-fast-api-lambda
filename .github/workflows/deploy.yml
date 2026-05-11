@@ -1,17 +1,5 @@
-# .github/workflows/deploy.yml
-#
-# ─── HOW THIS DIFFERS FROM THE STREAMING LAMBDA PIPELINE ─────────────────────
-# The streaming Lambda is Node.js — we use npm ci + zip.
-# This Lambda is Python — we use pip install + zip.
-#
-# The key challenge with Python Lambdas is that some packages (like pydantic)
-# have compiled C extensions that must be built for the Lambda Linux environment.
-# We solve this by using --platform manylinux2014_x86_64 when installing,
-# which downloads the Linux-compatible pre-built wheels regardless of what
-# OS the GitHub runner is using.
-#
 # ─── WHAT THIS PIPELINE DOES ─────────────────────────────────────────────────
-# 1. Triggered on push to dev or main
+# 1. Triggered on push to dev
 # 2. test job  → validates Python syntax, checks required files exist
 # 3. deploy job → installs deps for Linux, zips correctly, uploads to Lambda
 # ─────────────────────────────────────────────────────────────────────────────
@@ -21,11 +9,7 @@ name: Deploy FastAPI Lambda
 on:
   push:
     branches:
-      - main
       - dev
-  pull_request:
-    branches:
-      - main
 
 env:
   AWS_REGION: us-east-1
@@ -50,11 +34,6 @@ jobs:
           cache: 'pip'
 
       # Install dependencies normally for the test job.
-      # We do NOT use --platform flags here because those download
-      # Linux wheels but don't install them into the runner's Python,
-      # which would cause "No module named boto3" errors.
-      # boto3 is provided by the Lambda runtime so it's fine to
-      # install it normally just for syntax checking.
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -79,8 +58,6 @@ jobs:
           test -d app/middleware             || (echo "Missing app/middleware/" && exit 1)
           echo "All required files present ✓"
 
-      # Compile each module individually — catches import errors
-      # and syntax issues without needing the full app to boot
       - name: Check FastAPI routes compile
         run: |
           echo "Checking routers..."
@@ -110,9 +87,6 @@ jobs:
           cache: 'pip'
 
       # Install packages for Lambda Linux environment
-      # --platform manylinux2014_x86_64 gets Linux-compatible binaries
-      # --only-binary=:all: never compiles from source
-      # --target .deps/ installs into a local folder for zipping
       - name: Install dependencies for Lambda Linux environment
         run: |
           echo "Installing packages for Lambda Linux (x86_64)..."
@@ -136,7 +110,7 @@ jobs:
           cd .deps
           zip -r ../function.zip . -q
           cd ..
-          zip -r function.zip app/ lambda_handler.py requirements.txt -q
+          zip -r function.zip app/ lambda_handler.py -q
           echo "Zip size: $(du -sh function.zip | cut -f1)"
 
       - name: Configure AWS credentials
@@ -163,7 +137,6 @@ jobs:
             --region ${{ env.AWS_REGION }}
           echo "Lambda is ready ✓"
 
-      # Smoke test — hits /health after deploy
       # Catches startup errors immediately after deployment
       - name: Smoke test — health endpoint
         run: |
@@ -202,5 +175,4 @@ jobs:
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY      # Import check — verifies FastAPI app loads without errors
-      # This catches missing imports, config errors, syntax issues in dependencies
+          echo "| Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY

@@ -27,10 +27,6 @@ class Settings(BaseSettings):
         description="Comma-separated list of allowed origins"
     )
 
-    # Pagination
-    default_page_size: int = Field(default=20, ge=1, le=100)
-    max_page_size: int = Field(default=100, ge=1, le=1000)
-
     class Config:
         env_file = ".env"
 

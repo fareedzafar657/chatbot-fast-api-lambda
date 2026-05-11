@@ -24,10 +24,7 @@ async def get_branch(
     user: dict = Depends(get_current_user),
 ):
     """Get a single branch including its selectedMsgIds."""
-    branch = await db.get_branch(branch_id)
-    # Verify ownership via session
-    await db.get_session(branch["session_id"], user["sub"])
-    return branch
+    return await db.get_branch(branch_id, user["sub"])
 
 
 @router.post("/fork", response_model=Branch, status_code=201)

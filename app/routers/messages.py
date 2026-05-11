@@ -1,13 +1,11 @@
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query
 from app.middleware.auth import get_current_user
 from app.models.schemas import (
     Message, PaginatedMessages, PatchMessageRequest, SuccessResponse
 )
 from app.services import dynamodb as db
-from app.config import get_settings
 
 router = APIRouter(prefix="/messages", tags=["Messages"])
-settings = get_settings()
 
 
 @router.get("/branch/{branch_id}", response_model=PaginatedMessages)
@@ -30,7 +28,7 @@ async def list_messages(
     result = await db.list_messages(
         branch_id=branch_id,
         user_id=user["sub"],
-        page_size=min(page_size, settings.max_page_size),
+        page_size=page_size,
         cursor=cursor,
         include_deleted=include_deleted,
     )
@@ -63,12 +61,6 @@ async def patch_message(
     Note: editing content is only valid once the response is fully generated.
     The streaming Lambda enforces the stop state during generation.
     """
-    if body.state == "edited" and not body.content:
-        raise HTTPException(
-            status_code=400,
-            detail="content is required when state is 'edited'"
-        )
-
     return await db.patch_message(
         msg_id=msg_id,
         user_id=user["sub"],

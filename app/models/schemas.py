@@ -1,6 +1,5 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, Literal
-from datetime import datetime
 
 
 # ─── Enums ───────────────────────────────────────────────────────────────────
@@ -16,7 +15,7 @@ class Message(BaseModel):
     session_id:   str
     branch_id:    str
     role:         MessageRole
-    content:      str
+    content:      Optional[str] = None
     state:        MessageState
     user_id:      str
     parent_msg_id: Optional[str] = None
@@ -29,6 +28,14 @@ class Message(BaseModel):
 class PatchMessageRequest(BaseModel):
     state:   Optional[MessageState] = None
     content: Optional[str] = None          # only used when state = edited
+
+    @model_validator(mode="after")
+    def at_least_one_field(self):
+        if self.state is None and self.content is None:
+            raise ValueError("At least one of 'state' or 'content' must be provided")
+        if self.state == "edited" and not self.content:
+            raise ValueError("content is required when state is 'edited'")
+        return self
 
     model_config = {"json_schema_extra": {
         "examples": [
@@ -90,12 +97,18 @@ class UpdateSessionRequest(BaseModel):
     title:            Optional[str] = None
     active_branch_id: Optional[str] = None
 
+    @model_validator(mode="after")
+    def at_least_one_field(self):
+        if self.title is None and self.active_branch_id is None:
+            raise ValueError("At least one of 'title' or 'active_branch_id' must be provided")
+        return self
+
 
 # ─── Paginated responses ──────────────────────────────────────────────────────
 
 class PaginatedMessages(BaseModel):
     items:       list[Message]
-    total:       int
+    count:       int
     page:        int
     page_size:   int
     has_more:    bool
@@ -104,11 +117,36 @@ class PaginatedMessages(BaseModel):
 
 class PaginatedSessions(BaseModel):
     items:       list[Session]
-    total:       int
+    count:       int
     page:        int
     page_size:   int
     has_more:    bool
     next_cursor: Optional[str] = None
+
+
+# ─── Usage Stats ─────────────────────────────────────────────────────────────
+
+class DailyUsage(BaseModel):
+    date:          str
+    input_tokens:  int
+    output_tokens: int
+    message_count: int
+
+
+class ModelBreakdown(BaseModel):
+    model_id:    str
+    token_count: int
+    percentage:  int
+
+
+class UsageStats(BaseModel):
+    total_messages:      int
+    total_input_tokens:  int
+    total_output_tokens: int
+    total_tokens:        int
+    estimated_cost_usd:  float
+    daily_usage:         list[DailyUsage]
+    model_breakdown:     list[ModelBreakdown]
 
 
 # ─── Generic responses ────────────────────────────────────────────────────────

@@ -1,16 +1,14 @@
 from fastapi import APIRouter, Depends, Query
 from app.middleware.auth import get_current_user
 from app.models.schemas import (
-    Session, PaginatedSessions, UpdateSessionRequest, SuccessResponse
+    Session, PaginatedSessions, UpdateSessionRequest, SuccessResponse, UsageStats
 )
 from app.services import dynamodb as db
-from app.config import get_settings
 
 router = APIRouter(prefix="/sessions", tags=["Sessions"])
-settings = get_settings()
 
 
-@router.get("/usage/stats")
+@router.get("/usage/stats", response_model=UsageStats)
 async def get_usage_stats(
     user: dict = Depends(get_current_user),
 ):
@@ -27,7 +25,7 @@ async def list_sessions(
     """List all sessions for the current user, most recently active first."""
     result = await db.list_sessions(
         user_id=user["sub"],
-        page_size=min(page_size, settings.max_page_size),
+        page_size=page_size,
         cursor=cursor,
     )
     return result
@@ -61,6 +59,6 @@ async def delete_session(
     session_id: str,
     user: dict = Depends(get_current_user),
 ):
-    """Delete a session. This does not delete messages (they orphan gracefully)."""
+    """Delete a session and all its branches and messages."""
     await db.delete_session(session_id, user["sub"])
     return SuccessResponse(message="Session deleted")

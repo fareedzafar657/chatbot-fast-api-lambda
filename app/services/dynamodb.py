@@ -2,7 +2,6 @@ import boto3
 import base64
 import json
 from boto3.dynamodb.conditions import Key
-from botocore.exceptions import ClientError
 from uuid import uuid4
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
@@ -110,7 +109,7 @@ async def list_sessions(user_id: str, page_size: int, cursor: str | None) -> dic
 
     return {
         "items":       items,
-        "total":       len(items),
+        "count":       len(items),
         "page_size":   page_size,
         "has_more":    next_cursor is not None,
         "next_cursor": next_cursor,
@@ -132,7 +131,6 @@ async def get_session(session_id: str, user_id: str) -> dict:
 
 
 async def update_session(session_id: str, user_id: str, updates: dict) -> dict:
-    # Verify ownership first
     await get_session(session_id, user_id)
 
     table = get_table(DYNAMO_SESSIONS_TABLE)
@@ -164,8 +162,47 @@ async def update_session(session_id: str, user_id: str, updates: dict) -> dict:
 
 async def delete_session(session_id: str, user_id: str):
     await get_session(session_id, user_id)
-    table = get_table(DYNAMO_SESSIONS_TABLE)
-    table.delete_item(Key={"sessionId": session_id})
+
+    branches_table = get_table(DYNAMO_BRANCHES_TABLE)
+    messages_table = get_table(DYNAMO_MESSAGES_TABLE)
+
+    # Collect all branch IDs for this session
+    branch_ids = []
+    branch_kwargs: dict = {
+        "IndexName": "sessionId-createdAt-index",
+        "KeyConditionExpression": Key("sessionId").eq(session_id),
+        "ProjectionExpression": "branchId",
+    }
+    while True:
+        resp = branches_table.query(**branch_kwargs)
+        branch_ids.extend(item["branchId"] for item in resp.get("Items", []))
+        if "LastEvaluatedKey" not in resp:
+            break
+        branch_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    # Delete all messages across all branches
+    with messages_table.batch_writer() as batch:
+        for branch_id in branch_ids:
+            msg_kwargs: dict = {
+                "IndexName": "branchId-createdAt-index",
+                "KeyConditionExpression": Key("branchId").eq(branch_id),
+                "ProjectionExpression": "msgId",
+            }
+            while True:
+                resp = messages_table.query(**msg_kwargs)
+                for item in resp.get("Items", []):
+                    batch.delete_item(Key={"msgId": item["msgId"]})
+                if "LastEvaluatedKey" not in resp:
+                    break
+                msg_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    # Delete all branches
+    with branches_table.batch_writer() as batch:
+        for branch_id in branch_ids:
+            batch.delete_item(Key={"branchId": branch_id})
+
+    # Delete the session
+    get_table(DYNAMO_SESSIONS_TABLE).delete_item(Key={"sessionId": session_id})
 
 
 # ─── Branches ────────────────────────────────────────────────────────────────
@@ -183,12 +220,13 @@ async def list_branches(session_id: str, user_id: str) -> list[dict]:
     return [db_to_branch(i) for i in response.get("Items", [])]
 
 
-async def get_branch(branch_id: str) -> dict:
+async def get_branch(branch_id: str, user_id: str) -> dict:
     table = get_table(DYNAMO_BRANCHES_TABLE)
     response = table.get_item(Key={"branchId": branch_id})
     item = response.get("Item")
     if not item:
         raise HTTPException(status_code=404, detail="Branch not found")
+    await get_session(item["sessionId"], user_id)
     return db_to_branch(item)
 
 
@@ -213,22 +251,18 @@ async def fork_branch(user_id: str, data: dict) -> dict:
     messages_table = get_table(DYNAMO_MESSAGES_TABLE)
     new_msg_ids = []
     for msg_id in selected_msg_ids:
-        try:
-            response = messages_table.get_item(Key={"msgId": msg_id})
-            if "Item" in response:
-                original_msg = response["Item"]
-                new_msg_id = f"msg_{uuid4()}"
-                # Create a copy with new msgId and new branchId
-                duplicated_msg = {
-                    **original_msg,
-                    "msgId": new_msg_id,
-                    "branchId": branch_id,
-                    "createdAt": now_iso(),
-                }
-                messages_table.put_item(Item=duplicated_msg)
-                new_msg_ids.append(new_msg_id)
-        except ClientError:
-            pass  # skip if message not found
+        response = messages_table.get_item(Key={"msgId": msg_id})
+        if "Item" in response:
+            original_msg = response["Item"]
+            new_msg_id = f"msg_{uuid4()}"
+            duplicated_msg = {
+                **original_msg,
+                "msgId": new_msg_id,
+                "branchId": branch_id,
+                "createdAt": now_iso(),
+            }
+            messages_table.put_item(Item=duplicated_msg)
+            new_msg_ids.append(new_msg_id)
 
     # Create the branch with the new message IDs
     item = {
@@ -255,9 +289,7 @@ async def list_messages(
     cursor: str | None,
     include_deleted: bool = False,
 ) -> dict:
-    # Get branch to verify it belongs to a session owned by this user
-    branch = await get_branch(branch_id)
-    await get_session(branch["session_id"], user_id)
+    await get_branch(branch_id, user_id)
 
     table = get_table(DYNAMO_MESSAGES_TABLE)
 
@@ -285,7 +317,7 @@ async def list_messages(
 
     return {
         "items":       items,
-        "total":       len(items),
+        "count":       len(items),
         "page_size":   page_size,
         "page":        1,
         "has_more":    next_cursor is not None,
@@ -301,24 +333,22 @@ async def get_message(msg_id: str, user_id: str) -> dict:
     if not item:
         raise HTTPException(status_code=404, detail="Message not found")
 
-    # Verify ownership via session
     await get_session(item["sessionId"], user_id)
     return db_to_message(item)
 
 
 async def patch_message(msg_id: str, user_id: str, state: str | None, content: str | None) -> dict:
-    # Verify ownership
     await get_message(msg_id, user_id)
 
     table = get_table(DYNAMO_MESSAGES_TABLE)
-    expressions = ["#st = :state", "updatedAt = :now"]
-    names  = {"#st": "state"}
+    expressions = ["updatedAt = :now"]
+    names  = {}
     values = {":now": now_iso()}
 
-    if state:
+    if state is not None:
+        expressions.append("#st = :state")
+        names["#st"] = "state"
         values[":state"] = state
-    else:
-        values[":state"] = "active"
 
     if content is not None:
         expressions.append("content = :content")
@@ -389,10 +419,10 @@ async def get_usage_stats(user_id: str) -> dict:
 
     daily_usage = [
         {
-            "date": date,
-            "inputTokens": v["inputTokens"],
-            "outputTokens": v["outputTokens"],
-            "messageCount": v["messageCount"],
+            "date":          date,
+            "input_tokens":  v["inputTokens"],
+            "output_tokens": v["outputTokens"],
+            "message_count": v["messageCount"],
         }
         for date, v in sorted(daily.items())
         if date != "unknown"
@@ -401,9 +431,9 @@ async def get_usage_stats(user_id: str) -> dict:
     grand_total = total_tokens or 1  # avoid division by zero
     model_breakdown = [
         {
-            "modelId": mid,
-            "tokenCount": count,
-            "percentage": round(count / grand_total * 100),
+            "model_id":    mid,
+            "token_count": count,
+            "percentage":  round(count / grand_total * 100),
         }
         for mid, count in sorted(model_tokens.items(), key=lambda x: -x[1])
     ]
