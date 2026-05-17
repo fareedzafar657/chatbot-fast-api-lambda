@@ -1,13 +1,21 @@
 import boto3
 import base64
 import json
+import logging
 from boto3.dynamodb.conditions import Key
 from uuid import uuid4
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
-from app.config import get_settings, DYNAMO_SESSIONS_TABLE, DYNAMO_BRANCHES_TABLE, DYNAMO_MESSAGES_TABLE
+from app.config import get_settings
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# ─── GSI names ───────────────────────────────────────────────────────────────
+IDX_USER_UPDATED    = "userId-updatedAt-index"
+IDX_SESSION_CREATED = "sessionId-createdAt-index"
+IDX_BRANCH_CREATED  = "branchId-createdAt-index"
+IDX_USER_CREATED    = "userId-createdAt-index"
 
 # ─── Client (singleton) ───────────────────────────────────────────────────────
 _dynamodb = None
@@ -29,6 +37,16 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _paginate_query(table, **kwargs):
+    """Yield every item from a paginated DynamoDB query."""
+    while True:
+        resp = table.query(**kwargs)
+        yield from resp.get("Items", [])
+        if "LastEvaluatedKey" not in resp:
+            break
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+
 def encode_cursor(last_evaluated_key: dict) -> str:
     return base64.b64encode(json.dumps(last_evaluated_key).encode()).decode()
 
@@ -36,7 +54,8 @@ def encode_cursor(last_evaluated_key: dict) -> str:
 def decode_cursor(cursor: str) -> dict:
     try:
         return json.loads(base64.b64decode(cursor.encode()).decode())
-    except Exception:
+    except (ValueError, KeyError, json.JSONDecodeError) as e:
+        logger.warning(f"Cursor decode failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid pagination cursor"
@@ -88,10 +107,10 @@ def db_to_session(item: dict) -> dict:
 # ─── Sessions ────────────────────────────────────────────────────────────────
 
 async def list_sessions(user_id: str, page_size: int, cursor: str | None) -> dict:
-    table = get_table(DYNAMO_SESSIONS_TABLE)
+    table = get_table(settings.dynamo_sessions_table)
 
     kwargs = {
-        "IndexName": "userId-updatedAt-index",
+        "IndexName": IDX_USER_UPDATED,
         "KeyConditionExpression": Key("userId").eq(user_id),
         "Limit": page_size,
         "ScanIndexForward": False,   # most recent first
@@ -118,7 +137,7 @@ async def list_sessions(user_id: str, page_size: int, cursor: str | None) -> dic
 
 
 async def get_session(session_id: str, user_id: str) -> dict:
-    table = get_table(DYNAMO_SESSIONS_TABLE)
+    table = get_table(settings.dynamo_sessions_table)
     response = table.get_item(Key={"sessionId": session_id})
     item = response.get("Item")
 
@@ -133,7 +152,7 @@ async def get_session(session_id: str, user_id: str) -> dict:
 async def update_session(session_id: str, user_id: str, updates: dict) -> dict:
     await get_session(session_id, user_id)
 
-    table = get_table(DYNAMO_SESSIONS_TABLE)
+    table = get_table(settings.dynamo_sessions_table)
     expressions = ["updatedAt = :now"]
     values = {":now": now_iso()}
     names = {}
@@ -163,38 +182,30 @@ async def update_session(session_id: str, user_id: str, updates: dict) -> dict:
 async def delete_session(session_id: str, user_id: str):
     await get_session(session_id, user_id)
 
-    branches_table = get_table(DYNAMO_BRANCHES_TABLE)
-    messages_table = get_table(DYNAMO_MESSAGES_TABLE)
+    branches_table = get_table(settings.dynamo_branches_table)
+    messages_table = get_table(settings.dynamo_messages_table)
 
     # Collect all branch IDs for this session
-    branch_ids = []
-    branch_kwargs: dict = {
-        "IndexName": "sessionId-createdAt-index",
-        "KeyConditionExpression": Key("sessionId").eq(session_id),
-        "ProjectionExpression": "branchId",
-    }
-    while True:
-        resp = branches_table.query(**branch_kwargs)
-        branch_ids.extend(item["branchId"] for item in resp.get("Items", []))
-        if "LastEvaluatedKey" not in resp:
-            break
-        branch_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+    branch_ids = [
+        item["branchId"]
+        for item in _paginate_query(
+            branches_table,
+            IndexName=IDX_SESSION_CREATED,
+            KeyConditionExpression=Key("sessionId").eq(session_id),
+            ProjectionExpression="branchId",
+        )
+    ]
 
     # Delete all messages across all branches
     with messages_table.batch_writer() as batch:
         for branch_id in branch_ids:
-            msg_kwargs: dict = {
-                "IndexName": "branchId-createdAt-index",
-                "KeyConditionExpression": Key("branchId").eq(branch_id),
-                "ProjectionExpression": "msgId",
-            }
-            while True:
-                resp = messages_table.query(**msg_kwargs)
-                for item in resp.get("Items", []):
-                    batch.delete_item(Key={"msgId": item["msgId"]})
-                if "LastEvaluatedKey" not in resp:
-                    break
-                msg_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+            for item in _paginate_query(
+                messages_table,
+                IndexName=IDX_BRANCH_CREATED,
+                KeyConditionExpression=Key("branchId").eq(branch_id),
+                ProjectionExpression="msgId",
+            ):
+                batch.delete_item(Key={"msgId": item["msgId"]})
 
     # Delete all branches
     with branches_table.batch_writer() as batch:
@@ -202,7 +213,7 @@ async def delete_session(session_id: str, user_id: str):
             batch.delete_item(Key={"branchId": branch_id})
 
     # Delete the session
-    get_table(DYNAMO_SESSIONS_TABLE).delete_item(Key={"sessionId": session_id})
+    get_table(settings.dynamo_sessions_table).delete_item(Key={"sessionId": session_id})
 
 
 # ─── Branches ────────────────────────────────────────────────────────────────
@@ -211,7 +222,7 @@ async def list_branches(session_id: str, user_id: str) -> list[dict]:
     # Verify session ownership
     await get_session(session_id, user_id)
 
-    table = get_table(DYNAMO_BRANCHES_TABLE)
+    table = get_table(settings.dynamo_branches_table)
     response = table.query(
         IndexName="sessionId-createdAt-index",
         KeyConditionExpression=Key("sessionId").eq(session_id),
@@ -221,7 +232,7 @@ async def list_branches(session_id: str, user_id: str) -> list[dict]:
 
 
 async def get_branch(branch_id: str, user_id: str) -> dict:
-    table = get_table(DYNAMO_BRANCHES_TABLE)
+    table = get_table(settings.dynamo_branches_table)
     response = table.get_item(Key={"branchId": branch_id})
     item = response.get("Item")
     if not item:
@@ -248,7 +259,7 @@ async def fork_branch(user_id: str, data: dict) -> dict:
     branch_id = f"branch_{uuid4()}"
 
     # Duplicate selected messages into the new branch with new IDs
-    messages_table = get_table(DYNAMO_MESSAGES_TABLE)
+    messages_table = get_table(settings.dynamo_messages_table)
     new_msg_ids = []
     for msg_id in selected_msg_ids:
         response = messages_table.get_item(Key={"msgId": msg_id})
@@ -275,7 +286,7 @@ async def fork_branch(user_id: str, data: dict) -> dict:
         "createdAt":      now_iso(),
     }
 
-    table = get_table(DYNAMO_BRANCHES_TABLE)
+    table = get_table(settings.dynamo_branches_table)
     table.put_item(Item=item)
     return db_to_branch(item)
 
@@ -291,10 +302,10 @@ async def list_messages(
 ) -> dict:
     await get_branch(branch_id, user_id)
 
-    table = get_table(DYNAMO_MESSAGES_TABLE)
+    table = get_table(settings.dynamo_messages_table)
 
     kwargs = {
-        "IndexName": "branchId-createdAt-index",
+        "IndexName": IDX_BRANCH_CREATED,
         "KeyConditionExpression": Key("branchId").eq(branch_id),
         "Limit": page_size,
         "ScanIndexForward": True,    # oldest first (chronological)
@@ -326,7 +337,7 @@ async def list_messages(
 
 
 async def get_message(msg_id: str, user_id: str) -> dict:
-    table = get_table(DYNAMO_MESSAGES_TABLE)
+    table = get_table(settings.dynamo_messages_table)
     response = table.get_item(Key={"msgId": msg_id})
     item = response.get("Item")
 
@@ -340,7 +351,7 @@ async def get_message(msg_id: str, user_id: str) -> dict:
 async def patch_message(msg_id: str, user_id: str, state: str | None, content: str | None) -> dict:
     await get_message(msg_id, user_id)
 
-    table = get_table(DYNAMO_MESSAGES_TABLE)
+    table = get_table(settings.dynamo_messages_table)
     expressions = ["updatedAt = :now"]
     names  = {}
     values = {":now": now_iso()}
@@ -371,22 +382,37 @@ async def delete_message(msg_id: str, user_id: str):
 
 # ─── Usage Stats ─────────────────────────────────────────────────────────────
 
+MODEL_COSTS: dict[str, tuple[float, float]] = {
+    # (input_rate, output_rate) per 1K tokens
+    "amazon.nova-micro-v1:0":    (0.000035,  0.00014),
+    "amazon.nova-lite-v1:0":     (0.00006,   0.00024),
+    "us.amazon.nova-pro-v1:0":   (0.0008,    0.0032),
+    "claude-haiku-4-5-20251001": (0.0008,    0.004),
+    "claude-sonnet-4-5":         (0.003,     0.015),
+    "claude-opus-4-7":           (0.015,     0.075),
+    "gemini-2.5-flash":          (0.0000375, 0.00015),
+    "gemini-2.5-pro":            (0.00125,   0.005),
+}
+_DEFAULT_COST = (0.000035, 0.00014)  # Nova Micro fallback for unknown models
+
+
 async def get_usage_stats(user_id: str) -> dict:
     """Aggregate token usage for a user across all messages."""
-    table = get_table(DYNAMO_MESSAGES_TABLE)
+    table = get_table(settings.dynamo_messages_table)
 
     total_input_tokens = 0
     total_output_tokens = 0
     total_messages = 0
+    estimated_cost = 0.0
     daily: dict[str, dict] = {}
     model_tokens: dict[str, int] = {}
 
+    # Query all messages by userId — only user messages have userId on them
+    # (assistant messages didn't store userId historically). We identify assistant
+    # turns by the presence of inputTokens/outputTokens rather than role filter.
     kwargs = {
-        "IndexName": "userId-createdAt-index",
+        "IndexName": IDX_USER_CREATED,
         "KeyConditionExpression": Key("userId").eq(user_id),
-        "FilterExpression": "#role = :assistant",
-        "ExpressionAttributeNames": {"#role": "role"},
-        "ExpressionAttributeValues": {":assistant": "assistant"},
     }
 
     while True:
@@ -394,6 +420,11 @@ async def get_usage_stats(user_id: str) -> dict:
         for item in response.get("Items", []):
             input_tokens  = int(item.get("inputTokens")  or 0)
             output_tokens = int(item.get("outputTokens") or 0)
+
+            # Skip user messages — they have no token data
+            if input_tokens == 0 and output_tokens == 0:
+                continue
+
             model_id      = item.get("modelId", "amazon.nova-micro-v1:0")
             created_at    = item.get("createdAt", "")
             date_str      = created_at[:10] if len(created_at) >= 10 else "unknown"
@@ -401,6 +432,11 @@ async def get_usage_stats(user_id: str) -> dict:
             total_input_tokens  += input_tokens
             total_output_tokens += output_tokens
             total_messages      += 1
+
+            if model_id not in MODEL_COSTS:
+                logger.warning(f"Unknown modelId '{model_id}' — using default cost rate")
+            in_rate, out_rate = MODEL_COSTS.get(model_id, _DEFAULT_COST)
+            estimated_cost += (input_tokens / 1000) * in_rate + (output_tokens / 1000) * out_rate
 
             if date_str not in daily:
                 daily[date_str] = {"inputTokens": 0, "outputTokens": 0, "messageCount": 0}
@@ -415,7 +451,6 @@ async def get_usage_stats(user_id: str) -> dict:
         kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 
     total_tokens = total_input_tokens + total_output_tokens
-    estimated_cost = (total_input_tokens / 1000) * 0.000035 + (total_output_tokens / 1000) * 0.000035
 
     daily_usage = [
         {

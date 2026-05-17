@@ -1,11 +1,7 @@
+import re
 from pydantic import Field, field_validator, ValidationError
 from pydantic_settings import BaseSettings
 from functools import lru_cache
-
-# DynamoDB table names (fixed for this application)
-DYNAMO_MESSAGES_TABLE = "chatbot_messages"
-DYNAMO_BRANCHES_TABLE = "chatbot_branches"
-DYNAMO_SESSIONS_TABLE = "chatbot_sessions"
 
 
 class Settings(BaseSettings):
@@ -20,6 +16,11 @@ class Settings(BaseSettings):
         description="Cognito client ID (required for token validation)"
     )
     cognito_region: str = Field(default="us-east-1")
+
+    # DynamoDB table names — overridable per environment
+    dynamo_messages_table: str = Field(default="chatbot_messages")
+    dynamo_branches_table: str = Field(default="chatbot_branches")
+    dynamo_sessions_table: str = Field(default="chatbot_sessions")
 
     # CORS — set to your frontend domain in production
     cors_origins: str = Field(
@@ -38,7 +39,7 @@ class Settings(BaseSettings):
                 "COGNITO_USER_POOL_ID is required and cannot be empty. "
                 "Set it in your .env or Lambda environment variables."
             )
-        if not v.startswith("us-") and "_" not in v:
+        if not re.match(r'^[a-z]{2}-[a-z]+-\d+_\w+$', v):
             raise ValueError(
                 f"COGNITO_USER_POOL_ID looks invalid: {v}. "
                 f"Expected format like 'us-east-1_XXXXXXXXX'"

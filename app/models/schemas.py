@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field, model_validator
-from typing import Optional, Literal
+from typing import Optional, Literal, Generic, TypeVar
+
+T = TypeVar('T')
 
 
 # ─── Enums ───────────────────────────────────────────────────────────────────
@@ -27,7 +29,7 @@ class Message(BaseModel):
 
 class PatchMessageRequest(BaseModel):
     state:   Optional[MessageState] = None
-    content: Optional[str] = None          # only used when state = edited
+    content: Optional[str] = Field(None, max_length=100_000)  # only used when state = edited
 
     @model_validator(mode="after")
     def at_least_one_field(self):
@@ -63,8 +65,8 @@ class ForkBranchRequest(BaseModel):
     session_id:       str
     parent_branch_id: str
     parent_msg_id:    Optional[str] = None
-    selected_msg_ids: list[str] = Field(..., min_length=1)
-    label:            Optional[str] = None
+    selected_msg_ids: list[str] = Field(..., min_length=1, max_length=500)
+    label:            Optional[str] = Field(None, max_length=200)
 
     model_config = {"json_schema_extra": {
         "examples": [{
@@ -94,7 +96,7 @@ class Session(BaseModel):
 
 
 class UpdateSessionRequest(BaseModel):
-    title:            Optional[str] = None
+    title:            Optional[str] = Field(None, max_length=500)
     active_branch_id: Optional[str] = None
 
     @model_validator(mode="after")
@@ -106,8 +108,8 @@ class UpdateSessionRequest(BaseModel):
 
 # ─── Paginated responses ──────────────────────────────────────────────────────
 
-class PaginatedMessages(BaseModel):
-    items:       list[Message]
+class PaginatedResponse(BaseModel, Generic[T]):
+    items:       list[T]
     count:       int
     page:        int
     page_size:   int
@@ -115,13 +117,8 @@ class PaginatedMessages(BaseModel):
     next_cursor: Optional[str] = None   # base64-encoded LastEvaluatedKey
 
 
-class PaginatedSessions(BaseModel):
-    items:       list[Session]
-    count:       int
-    page:        int
-    page_size:   int
-    has_more:    bool
-    next_cursor: Optional[str] = None
+PaginatedMessages = PaginatedResponse[Message]
+PaginatedSessions = PaginatedResponse[Session]
 
 
 # ─── Usage Stats ─────────────────────────────────────────────────────────────

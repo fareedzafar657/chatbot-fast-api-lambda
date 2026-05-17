@@ -85,9 +85,9 @@ async def get_current_user(
         if token_use == "access":
             if payload.get("client_id") != settings.cognito_client_id:
                 raise credentials_exception
-        elif token_use == "id":
-            if payload.get("aud") != settings.cognito_client_id:
-                raise credentials_exception
+        # elif token_use == "id":
+        #     if payload.get("aud") != settings.cognito_client_id:
+        #         raise credentials_exception
         else:
             raise credentials_exception
 
@@ -101,7 +101,7 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     except PyJWTError as e:
-        logger.warning(f"JWT validation failed: {str(e)}", extra={"token_prefix": token[:20]})
+        logger.warning("JWT validation failed")
         raise credentials_exception
     except httpx.HTTPError as e:
         logger.error(f"Failed to fetch Cognito JWKS: {str(e)}", exc_info=True)
