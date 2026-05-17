@@ -272,6 +272,9 @@ async def fork_branch(user_id: str, data: dict) -> dict:
                 "branchId": branch_id,
                 "createdAt": now_iso(),
             }
+            # Clear token counts — duplicated messages didn't consume new tokens
+            duplicated_msg.pop("inputTokens", None)
+            duplicated_msg.pop("outputTokens", None)
             messages_table.put_item(Item=duplicated_msg)
             new_msg_ids.append(new_msg_id)
 
