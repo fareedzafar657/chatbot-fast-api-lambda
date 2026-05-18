@@ -83,6 +83,15 @@ class UpdateActiveBranchRequest(BaseModel):
     branch_id: str
 
 
+class CherryPickRequest(BaseModel):
+    source_msg_ids: list[str] = Field(..., min_length=1, max_length=500)
+
+
+class CherryPickResponse(BaseModel):
+    branch:       Branch
+    new_messages: list[Message]
+
+
 # ─── Session ─────────────────────────────────────────────────────────────────
 
 class Session(BaseModel):

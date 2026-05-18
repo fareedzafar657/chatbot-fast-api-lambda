@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 from app.middleware.auth import get_current_user
-from app.models.schemas import Branch, ForkBranchRequest, SuccessResponse
+from app.models.schemas import Branch, ForkBranchRequest, CherryPickRequest, CherryPickResponse, SuccessResponse
 from app.services import dynamodb as db
 
 router = APIRouter(prefix="/branches", tags=["Branches"])
@@ -42,4 +42,18 @@ async def fork_branch(
     return await db.fork_branch(
         user_id=user["sub"],
         data=body.model_dump(),
+    )
+
+
+@router.post("/{branch_id}/cherry-pick", response_model=CherryPickResponse, status_code=200)
+async def cherry_pick(
+    branch_id: str,
+    body: CherryPickRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Append copied messages from other branches to an existing branch."""
+    return await db.cherry_pick_messages(
+        branch_id=branch_id,
+        user_id=user["sub"],
+        source_msg_ids=body.source_msg_ids,
     )

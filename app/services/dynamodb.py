@@ -294,6 +294,56 @@ async def fork_branch(user_id: str, data: dict) -> dict:
     return db_to_branch(item)
 
 
+async def cherry_pick_messages(branch_id: str, user_id: str, source_msg_ids: list[str]) -> dict:
+    # Verify branch ownership
+    target_branch = await get_branch(branch_id, user_id)
+
+    # Duplicate each source message into the target branch
+    messages_table = get_table(settings.dynamo_messages_table)
+    new_msg_ids = []
+    duplicated_items = []
+
+    for msg_id in source_msg_ids:
+        response = messages_table.get_item(Key={"msgId": msg_id})
+        if "Item" in response:
+            original_msg = response["Item"]
+            if original_msg.get("userId") != user_id:
+                raise HTTPException(status_code=403, detail="Access denied to source message")
+            new_msg_id = f"msg_{uuid4()}"
+            duplicated_msg = {
+                **original_msg,
+                "msgId": new_msg_id,
+                "branchId": branch_id,
+                "createdAt": now_iso(),
+            }
+            # Clear token counts — duplicated messages didn't consume new tokens
+            duplicated_msg.pop("inputTokens", None)
+            duplicated_msg.pop("outputTokens", None)
+            messages_table.put_item(Item=duplicated_msg)
+            new_msg_ids.append(new_msg_id)
+            duplicated_items.append(duplicated_msg)
+
+    # Append new message IDs to the target branch's selectedMsgIds
+    branches_table = get_table(settings.dynamo_branches_table)
+    branches_table.update_item(
+        Key={"branchId": branch_id},
+        UpdateExpression="SET selectedMsgIds = list_append(selectedMsgIds, :new_ids)",
+        ExpressionAttributeValues={":new_ids": new_msg_ids},
+    )
+
+    # Fetch the updated branch
+    response = branches_table.get_item(Key={"branchId": branch_id})
+    updated_branch = db_to_branch(response["Item"])
+
+    # Convert duplicated messages to API format
+    new_messages = [db_to_message(item) for item in duplicated_items]
+
+    return {
+        "branch":       updated_branch,
+        "new_messages": new_messages,
+    }
+
+
 # ─── Messages ────────────────────────────────────────────────────────────────
 
 async def list_messages(
