@@ -2,6 +2,7 @@ import boto3
 import base64
 import json
 import logging
+import httpx
 from boto3.dynamodb.conditions import Key
 from uuid import uuid4
 from datetime import datetime, timezone
@@ -65,18 +66,24 @@ def decode_cursor(cursor: str) -> dict:
 def db_to_message(item: dict) -> dict:
     """Convert DynamoDB item (camelCase) → API response (snake_case)."""
     return {
-        "msg_id":        item.get("msgId"),
-        "session_id":    item.get("sessionId"),
-        "branch_id":     item.get("branchId"),
-        "role":          item.get("role"),
-        "content":       item.get("content"),
-        "state":         item.get("state", "active"),
-        "user_id":       item.get("userId", ""),
-        "parent_msg_id": item.get("parentMsgId"),
-        "input_tokens":  int(item["inputTokens"])  if item.get("inputTokens")  else None,
-        "output_tokens": int(item["outputTokens"]) if item.get("outputTokens") else None,
-        "created_at":    item.get("createdAt"),
-        "updated_at":    item.get("updatedAt"),
+        "msg_id":           item.get("msgId"),
+        "session_id":       item.get("sessionId"),
+        "branch_id":        item.get("branchId"),
+        "role":             item.get("role"),
+        "content":          item.get("content"),
+        "state":            item.get("state", "active"),
+        "user_id":          item.get("userId", ""),
+        "parent_msg_id":    item.get("parentMsgId"),
+        "input_tokens":     int(item["inputTokens"])  if item.get("inputTokens")  else None,
+        "output_tokens":    int(item["outputTokens"]) if item.get("outputTokens") else None,
+        "created_at":       item.get("createdAt"),
+        "updated_at":       item.get("updatedAt"),
+        "type":             item.get("type"),
+        "compaction_name":  item.get("compactionName"),
+        "original_msg_ids": item.get("originalMsgIds"),
+        "tokens_before":    int(item["tokensBefore"]) if item.get("tokensBefore") else None,
+        "tokens_after":     int(item["tokensAfter"])  if item.get("tokensAfter")  else None,
+        "compacted_by":     item.get("compactedBy"),
     }
 
 
@@ -245,12 +252,13 @@ async def fork_branch(user_id: str, data: dict) -> dict:
     # Verify session ownership
     await get_session(data["session_id"], user_id)
 
-    # Validate: first selected message must be from user
+    # Validate: first selected message must be from user OR be a compaction summary
+    # (summaries are assistant-role but serve as context, not a regular AI reply)
     selected_msg_ids = data.get("selected_msg_ids", [])
     if selected_msg_ids:
         first_msg_id = selected_msg_ids[0]
         first_msg = await get_message(first_msg_id, user_id)
-        if first_msg["role"] != "user":
+        if first_msg["role"] != "user" and first_msg.get("type") != "compaction-summary":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="First message in branch must be from user"
@@ -275,6 +283,10 @@ async def fork_branch(user_id: str, data: dict) -> dict:
             # Clear token counts — duplicated messages didn't consume new tokens
             duplicated_msg.pop("inputTokens", None)
             duplicated_msg.pop("outputTokens", None)
+            # Forked copies of compacted originals become fresh active messages
+            if original_msg.get("state") == "compacted":
+                duplicated_msg["state"] = "active"
+                duplicated_msg.pop("compactedBy", None)
             messages_table.put_item(Item=duplicated_msg)
             new_msg_ids.append(new_msg_id)
 
@@ -344,6 +356,308 @@ async def cherry_pick_messages(branch_id: str, user_id: str, source_msg_ids: lis
     }
 
 
+_COMPACT_SYSTEM_PROMPT = (
+    "Summarize this conversation compactly, preserving all key facts, "
+    "decisions, and context so the conversation can continue naturally. "
+    "Be concise but complete."
+)
+
+
+def _summarize_anthropic(model: str, api_key: str, messages: list) -> tuple[str, int]:
+    resp = httpx.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+        json={"model": model, "system": _COMPACT_SYSTEM_PROMPT, "messages": messages, "max_tokens": 512},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["content"][0]["text"], data["usage"]["output_tokens"]
+
+
+def _extract_gemini_text(data: dict) -> str:
+    """Extract the response text from a Gemini generateContent response body."""
+    candidate = data.get("candidates", [{}])[0]
+    parts = candidate.get("content", {}).get("parts", [])
+    if not parts:
+        finish = candidate.get("finishReason", "unknown")
+        logger.error(f"Gemini no content parts (finishReason={finish!r}): {json.dumps(data)[:500]}")
+        raise ValueError(f"Gemini returned no content (finishReason={finish!r})")
+    # Gemini 2.5 thinking models prepend thought parts (thought=True) before the real response
+    all_text   = [p["text"] for p in parts if p.get("text")]
+    non_thought = [p["text"] for p in parts if p.get("text") and not p.get("thought")]
+    text_parts  = non_thought or all_text
+    if not text_parts:
+        raise ValueError("Gemini response has no text content")
+    return text_parts[0]
+
+
+def _summarize_gemini(model: str, api_key: str, messages: list) -> tuple[str, int]:
+    # Present the conversation as a single user turn rather than multi-turn contents.
+    # When contents ends with a model-role entry, Gemini returns STOP with zero output
+    # because it considers the conversation already complete — it won't continue on its own.
+    conv_text = "\n\n".join(
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][0]['text']}"
+        for m in messages
+    )
+    resp = httpx.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        params={"key": api_key},
+        json={
+            "systemInstruction": {"parts": [{"text": _COMPACT_SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": conv_text}]}],
+            "generationConfig": {"maxOutputTokens": 2048},
+        },
+        timeout=60,
+    )
+    if not resp.is_success:
+        logger.error(f"Gemini API error {resp.status_code} for model={model!r}: {resp.text[:500]}")
+    resp.raise_for_status()
+    data = resp.json()
+    tokens = data.get("usageMetadata", {}).get("candidatesTokenCount", 0)
+    return _extract_gemini_text(data), tokens
+
+
+async def _validate_compact_request(
+    branches_table, messages_table, branch_id: str, user_id: str, msg_ids: list[str]
+) -> tuple[dict, list[dict]]:
+    """Verify ownership, validate msg_ids belong to the branch, fetch + sort the messages.
+    Returns (branch_item, sorted msg_items)."""
+    branch_resp = branches_table.get_item(Key={"branchId": branch_id})
+    branch_item = branch_resp.get("Item")
+    if not branch_item:
+        raise HTTPException(status_code=404, detail="Branch not found")
+    await get_session(branch_item["sessionId"], user_id)
+
+    selected_msg_ids = branch_item.get("selectedMsgIds", [])
+    if not set(msg_ids).issubset(set(selected_msg_ids)):
+        raise HTTPException(status_code=400, detail="Some messages do not belong to this branch")
+
+    # Fetch all messages in batches of 100 (DynamoDB batch_get_item limit)
+    fetched: dict[str, dict] = {}
+    for i in range(0, len(msg_ids), 100):
+        chunk = msg_ids[i:i + 100]
+        resp = get_dynamodb().batch_get_item(
+            RequestItems={settings.dynamo_messages_table: {"Keys": [{"msgId": mid} for mid in chunk]}}
+        )
+        for item in resp.get("Responses", {}).get(settings.dynamo_messages_table, []):
+            fetched[item["msgId"]] = item
+
+    missing = [mid for mid in msg_ids if mid not in fetched]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Messages not found: {missing[:5]}")
+
+    msg_items = list(fetched.values())
+
+    # Sort by position in selectedMsgIds so the AI receives messages in chronological order
+    msg_id_to_pos = {mid: i for i, mid in enumerate(selected_msg_ids)}
+    msg_items.sort(key=lambda m: msg_id_to_pos.get(m["msgId"], 0))
+
+    if msg_items and msg_items[0].get("role") != "user":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="First selected message must be from user"
+        )
+
+    return branch_item, msg_items
+
+
+def _build_summary_item(
+    branch_item: dict, branch_id: str, user_id: str,
+    summary_text: str, name: str, msg_ids: list[str],
+    tokens_before: int, tokens_after: int,
+) -> dict:
+    """Construct the DynamoDB item for the compaction-summary message."""
+    now = now_iso()
+    return {
+        "msgId":          f"msg_{uuid4()}",
+        "sessionId":      branch_item["sessionId"],
+        "branchId":       branch_id,
+        "role":           "assistant",
+        "type":           "compaction-summary",
+        "content":        summary_text,
+        "compactionName": name,
+        "originalMsgIds": msg_ids,
+        "tokensBefore":   tokens_before,
+        "tokensAfter":    tokens_after,
+        "state":          "active",
+        "userId":         user_id,
+        "createdAt":      now,
+        "updatedAt":      now,
+    }
+
+
+def _mark_originals_as_compacted(messages_table, msg_ids: list[str], compacted_by: dict) -> None:
+    """Set state=compacted and attach compactedBy metadata on each original message."""
+    now = now_iso()
+    for msg_id in msg_ids:
+        messages_table.update_item(
+            Key={"msgId": msg_id},
+            UpdateExpression="SET #st = :compacted, compactedBy = :cb, updatedAt = :now",
+            ExpressionAttributeNames={"#st": "state"},
+            ExpressionAttributeValues={":compacted": "compacted", ":cb": compacted_by, ":now": now},
+        )
+
+
+def _summarize(
+    converse_messages: list,
+    provider: str | None,
+    model: str | None,
+    api_key: str | None,
+) -> tuple[str, int]:
+    """Route to the appropriate AI provider and return (summary_text, tokens_after)."""
+    if provider == "anthropic" and model and api_key:
+        return _summarize_anthropic(model, api_key, converse_messages)
+    if provider == "gemini" and model and api_key:
+        return _summarize_gemini(model, api_key, converse_messages)
+    # Default: Bedrock Nova Lite
+    bedrock      = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+    bedrock_resp = bedrock.converse(
+        modelId="amazon.nova-lite-v1:0",
+        system=[{"text": _COMPACT_SYSTEM_PROMPT}],
+        messages=converse_messages,
+        inferenceConfig={"maxTokens": 512},
+    )
+    content_blocks = bedrock_resp["output"]["message"]["content"]
+    return (content_blocks[0]["text"] if content_blocks else ""), bedrock_resp["usage"]["outputTokens"]
+
+
+def _splice_branch_ids(ids: list[str], old_ids: list[str], new_ids: list[str], error_detail: str) -> list[str]:
+    """Replace old_ids with new_ids in ids, preserving the position of the first old_id."""
+    old_set    = set(old_ids)
+    insert_idx = next((i for i, mid in enumerate(ids) if mid in old_set), None)
+    if insert_idx is None:
+        raise HTTPException(status_code=400, detail=error_detail)
+    return [mid for mid in ids[:insert_idx]] + new_ids + [mid for mid in ids[insert_idx:] if mid not in old_set]
+
+
+async def compact_messages(
+    branch_id: str,
+    user_id: str,
+    msg_ids: list[str],
+    name: str,
+    provider: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+) -> dict:
+    branches_table = get_table(settings.dynamo_branches_table)
+    messages_table = get_table(settings.dynamo_messages_table)
+
+    branch_item, msg_items = await _validate_compact_request(
+        branches_table, messages_table, branch_id, user_id, msg_ids
+    )
+
+    tokens_before = sum(len(m.get("content") or "") for m in msg_items) // 4
+
+    # Build messages in Bedrock/Anthropic format (role + content array)
+    converse_messages = [
+        {"role": m["role"], "content": [{"text": m.get("content") or ""}]}
+        for m in msg_items
+        if m.get("content")
+    ]
+
+    try:
+        summary_text, tokens_after = _summarize(converse_messages, provider, model, api_key)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Summarization failed ({provider or 'bedrock'}): {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to generate summary"
+        )
+
+    if not summary_text.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Provider returned an empty summary"
+        )
+
+    summary_item = _build_summary_item(
+        branch_item, branch_id, user_id, summary_text, name, msg_ids, tokens_before, tokens_after
+    )
+    messages_table.put_item(Item=summary_item)
+
+    # Replace compacted IDs with summary ID in selectedMsgIds (preserving order)
+    selected_msg_ids = branch_item.get("selectedMsgIds", [])
+    new_selected = _splice_branch_ids(
+        selected_msg_ids, msg_ids, [summary_item["msgId"]], "Messages not found in branch"
+    )
+    branches_table.update_item(
+        Key={"branchId": branch_id},
+        UpdateExpression="SET selectedMsgIds = :new_ids",
+        ExpressionAttributeValues={":new_ids": new_selected},
+    )
+
+    compacted_by = {"summaryMsgId": summary_item["msgId"], "name": name}
+    _mark_originals_as_compacted(messages_table, msg_ids, compacted_by)
+
+    return {
+        "summary_message": db_to_message(summary_item),
+        "tokens_before":   tokens_before,
+        "tokens_after":    tokens_after,
+    }
+
+
+async def delete_compaction(branch_id: str, summary_msg_id: str, user_id: str) -> dict:
+    branches_table = get_table(settings.dynamo_branches_table)
+    messages_table = get_table(settings.dynamo_messages_table)
+
+    # Verify branch ownership
+    branch_resp = branches_table.get_item(Key={"branchId": branch_id})
+    branch_item = branch_resp.get("Item")
+    if not branch_item:
+        raise HTTPException(status_code=404, detail="Branch not found")
+    await get_session(branch_item["sessionId"], user_id)
+
+    # Fetch and validate the summary message
+    summary_resp = messages_table.get_item(Key={"msgId": summary_msg_id})
+    summary = summary_resp.get("Item")
+    if not summary:
+        raise HTTPException(status_code=404, detail="Compaction summary not found")
+    if summary.get("type") != "compaction-summary":
+        raise HTTPException(status_code=400, detail="Message is not a compaction summary")
+    if summary.get("branchId") != branch_id:
+        raise HTTPException(status_code=400, detail="Message does not belong to this branch")
+
+    original_msg_ids = summary.get("originalMsgIds", [])
+
+    # Replace summary ID with original IDs in selectedMsgIds (preserving position)
+    selected = branch_item.get("selectedMsgIds", [])
+    new_selected = _splice_branch_ids(
+        selected, [summary_msg_id], original_msg_ids, "Summary not found in branch selectedMsgIds"
+    )
+    branches_table.update_item(
+        Key={"branchId": branch_id},
+        UpdateExpression="SET selectedMsgIds = :new_ids",
+        ExpressionAttributeValues={":new_ids": new_selected},
+    )
+
+    # Restore each original message to active state and remove compactedBy
+    now = now_iso()
+    restored_items = []
+    for msg_id in original_msg_ids:
+        resp = messages_table.update_item(
+            Key={"msgId": msg_id},
+            UpdateExpression="SET #st = :active, updatedAt = :now REMOVE compactedBy",
+            ExpressionAttributeNames={"#st": "state"},
+            ExpressionAttributeValues={":active": "active", ":now": now},
+            ReturnValues="ALL_NEW",
+        )
+        if "Attributes" in resp:
+            restored_items.append(resp["Attributes"])
+
+    # Soft-delete the summary message
+    messages_table.update_item(
+        Key={"msgId": summary_msg_id},
+        UpdateExpression="SET #st = :deleted, updatedAt = :now",
+        ExpressionAttributeNames={"#st": "state"},
+        ExpressionAttributeValues={":deleted": "deleted", ":now": now},
+    )
+
+    return {"restored_messages": [db_to_message(item) for item in restored_items]}
+
+
 # ─── Messages ────────────────────────────────────────────────────────────────
 
 async def list_messages(
@@ -361,7 +675,7 @@ async def list_messages(
         "IndexName": IDX_BRANCH_CREATED,
         "KeyConditionExpression": Key("branchId").eq(branch_id),
         "Limit": page_size,
-        "ScanIndexForward": True,    # oldest first (chronological)
+        "ScanIndexForward": False,   # newest first so latest messages (incl. summaries) load on page 1
     }
 
     if not include_deleted:
@@ -373,7 +687,8 @@ async def list_messages(
         kwargs["ExclusiveStartKey"] = decode_cursor(cursor)
 
     response = table.query(**kwargs)
-    items = [db_to_message(i) for i in response.get("Items", [])]
+    # Reverse so items are in ascending (oldest→newest) order for the frontend
+    items = [db_to_message(i) for i in reversed(response.get("Items", []))]
 
     next_cursor = None
     if "LastEvaluatedKey" in response:

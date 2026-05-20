@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 from app.middleware.auth import get_current_user
-from app.models.schemas import Branch, ForkBranchRequest, CherryPickRequest, CherryPickResponse, SuccessResponse
+from app.models.schemas import Branch, ForkBranchRequest, CherryPickRequest, CherryPickResponse, CompactRequest, CompactResponse, DeleteCompactionResponse, SuccessResponse
 from app.services import dynamodb as db
 
 router = APIRouter(prefix="/branches", tags=["Branches"])
@@ -56,4 +56,36 @@ async def cherry_pick(
         branch_id=branch_id,
         user_id=user["sub"],
         source_msg_ids=body.source_msg_ids,
+    )
+
+
+@router.post("/{branch_id}/compact", response_model=CompactResponse, status_code=200)
+async def compact_branch(
+    branch_id: str,
+    body: CompactRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Replace selected messages with an AI-generated summary to free context tokens."""
+    return await db.compact_messages(
+        branch_id=branch_id,
+        user_id=user["sub"],
+        msg_ids=body.msg_ids,
+        name=body.name,
+        provider=body.provider,
+        model=body.model,
+        api_key=body.api_key,
+    )
+
+
+@router.delete("/{branch_id}/compact/{summary_msg_id}", response_model=DeleteCompactionResponse)
+async def delete_compaction(
+    branch_id: str,
+    summary_msg_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Revert a compaction: restore original messages to active and remove the summary."""
+    return await db.delete_compaction(
+        branch_id=branch_id,
+        summary_msg_id=summary_msg_id,
+        user_id=user["sub"],
     )

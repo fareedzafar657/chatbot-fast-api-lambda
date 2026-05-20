@@ -7,7 +7,7 @@ T = TypeVar('T')
 # ─── Enums ───────────────────────────────────────────────────────────────────
 
 MessageRole  = Literal["user", "assistant"]
-MessageState = Literal["active", "stopped", "edited", "deleted"]
+MessageState = Literal["active", "stopped", "edited", "deleted", "compacted"]
 
 
 # ─── Message ─────────────────────────────────────────────────────────────────
@@ -25,6 +25,13 @@ class Message(BaseModel):
     output_tokens: Optional[int] = None
     created_at:   str
     updated_at:   str
+    # Compaction fields — present only on compaction-summary messages and their originals
+    type:              Optional[Literal["compaction-summary"]] = None
+    compaction_name:   Optional[str] = None
+    original_msg_ids:  Optional[list[str]] = None
+    tokens_before:     Optional[int] = None
+    tokens_after:      Optional[int] = None
+    compacted_by:      Optional[dict] = None
 
 
 class PatchMessageRequest(BaseModel):
@@ -90,6 +97,24 @@ class CherryPickRequest(BaseModel):
 class CherryPickResponse(BaseModel):
     branch:       Branch
     new_messages: list[Message]
+
+
+class CompactRequest(BaseModel):
+    msg_ids:  list[str] = Field(..., min_length=2, max_length=500)
+    name:     str       = Field(..., min_length=1, max_length=200)
+    provider: Optional[Literal["anthropic", "gemini"]] = None
+    model:    Optional[str] = None
+    api_key:  Optional[str] = None
+
+
+class CompactResponse(BaseModel):
+    summary_message: Message
+    tokens_before:   int
+    tokens_after:    int
+
+
+class DeleteCompactionResponse(BaseModel):
+    restored_messages: list[Message]
 
 
 # ─── Session ─────────────────────────────────────────────────────────────────
