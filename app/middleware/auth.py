@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 
@@ -17,23 +18,26 @@ settings = get_settings()
 
 _jwks_cache: dict | None = None
 _jwks_fetched_at: float = 0
-_JWKS_TTL = 3600  # re-fetch after 1 hour
+_JWKS_TTL = 3600
+_jwks_lock = asyncio.Lock()
 
 
 async def _get_jwks(jwks_url: str) -> dict:
     global _jwks_cache, _jwks_fetched_at
-    now = time.time()
-    if _jwks_cache is None or (now - _jwks_fetched_at) > _JWKS_TTL:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(jwks_url, timeout=5)
-            response.raise_for_status()
-            _jwks_cache = response.json()
-            _jwks_fetched_at = now
+    if _jwks_cache is not None and (time.time() - _jwks_fetched_at) <= _JWKS_TTL:
+        return _jwks_cache
+    async with _jwks_lock:
+        # Re-check inside lock — another coroutine may have already fetched while we waited
+        if _jwks_cache is None or (time.time() - _jwks_fetched_at) > _JWKS_TTL:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(jwks_url, timeout=5)
+                response.raise_for_status()
+                _jwks_cache = response.json()
+                _jwks_fetched_at = time.time()
     return _jwks_cache
 
 
 def _get_public_key(token: str, jwks: dict):
-    """Extract and construct the RSA public key matching this token's kid."""
     headers = jwt.get_unverified_header(token)
     kid = headers.get("kid")
     for key in jwks.get("keys", []):
@@ -73,7 +77,6 @@ async def get_current_user(
 
         # Decode without audience verification — Cognito access tokens use
         # `client_id` instead of `aud`, so PyJWT's built-in aud check fails.
-        # We verify the client manually below based on token_use.
         payload = jwt.decode(
             token,
             public_key,
@@ -85,9 +88,6 @@ async def get_current_user(
         if token_use == "access":
             if payload.get("client_id") != settings.cognito_client_id:
                 raise credentials_exception
-        # elif token_use == "id":
-        #     if payload.get("aud") != settings.cognito_client_id:
-        #         raise credentials_exception
         else:
             raise credentials_exception
 
@@ -100,7 +100,7 @@ async def get_current_user(
             detail="Token has expired",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    except PyJWTError as e:
+    except PyJWTError:
         logger.warning("JWT validation failed")
         raise credentials_exception
     except httpx.HTTPError as e:

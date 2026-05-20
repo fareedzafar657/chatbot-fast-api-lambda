@@ -64,7 +64,6 @@ async def health():
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    # Log the full exception internally (visible in CloudWatch)
     logger.error(
         "Unhandled exception",
         exc_info=True,
@@ -75,7 +74,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         }
     )
 
-    # Return generic message to client (no sensitive details leaked)
     return JSONResponse(
         status_code=500,
         content={"error": "Internal server error"},
@@ -83,6 +81,5 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # ─── Lambda handler ───────────────────────────────────────────────────────────
-# Mangum wraps FastAPI to work as a Lambda Function URL handler.
 
 handler = Mangum(app, lifespan="off")

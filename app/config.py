@@ -5,10 +5,8 @@ from functools import lru_cache
 
 
 class Settings(BaseSettings):
-    # AWS
     aws_region: str = Field(default="us-east-1")
 
-    # Cognito — REQUIRED in all environments
     cognito_user_pool_id: str = Field(
         description="User pool ID (required for JWT verification). Format: us-east-1_XXXXXXXXX"
     )
@@ -17,7 +15,6 @@ class Settings(BaseSettings):
     )
     cognito_region: str = Field(default="us-east-1")
 
-    # DynamoDB table names — overridable per environment
     dynamo_messages_table: str = Field(default="chatbot_messages")
     dynamo_branches_table: str = Field(default="chatbot_branches")
     dynamo_sessions_table: str = Field(default="chatbot_sessions")
@@ -61,7 +58,6 @@ class Settings(BaseSettings):
     def validate_cors_origins(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError("CORS_ORIGINS cannot be empty")
-        # Parse and validate each origin
         origins = [o.strip() for o in v.split(",") if o.strip()]
         if not origins:
             raise ValueError("CORS_ORIGINS must contain at least one valid origin")

@@ -39,7 +39,6 @@ def now_iso() -> str:
 
 
 def _paginate_query(table, **kwargs):
-    """Yield every item from a paginated DynamoDB query."""
     while True:
         resp = table.query(**kwargs)
         yield from resp.get("Items", [])
@@ -64,7 +63,6 @@ def decode_cursor(cursor: str) -> dict:
 
 
 def db_to_message(item: dict) -> dict:
-    """Convert DynamoDB item (camelCase) → API response (snake_case)."""
     return {
         "msg_id":           item.get("msgId"),
         "session_id":       item.get("sessionId"),
@@ -192,7 +190,6 @@ async def delete_session(session_id: str, user_id: str):
     branches_table = get_table(settings.dynamo_branches_table)
     messages_table = get_table(settings.dynamo_messages_table)
 
-    # Collect all branch IDs for this session
     branch_ids = [
         item["branchId"]
         for item in _paginate_query(
@@ -203,7 +200,10 @@ async def delete_session(session_id: str, user_id: str):
         )
     ]
 
-    # Delete all messages across all branches
+    # Delete the session row first — user no longer sees it even if child
+    # deletion is interrupted by a timeout or throttle error
+    get_table(settings.dynamo_sessions_table).delete_item(Key={"sessionId": session_id})
+
     with messages_table.batch_writer() as batch:
         for branch_id in branch_ids:
             for item in _paginate_query(
@@ -214,13 +214,9 @@ async def delete_session(session_id: str, user_id: str):
             ):
                 batch.delete_item(Key={"msgId": item["msgId"]})
 
-    # Delete all branches
     with branches_table.batch_writer() as batch:
         for branch_id in branch_ids:
             batch.delete_item(Key={"branchId": branch_id})
-
-    # Delete the session
-    get_table(settings.dynamo_sessions_table).delete_item(Key={"sessionId": session_id})
 
 
 # ─── Branches ────────────────────────────────────────────────────────────────
@@ -249,7 +245,6 @@ async def get_branch(branch_id: str, user_id: str) -> dict:
 
 
 async def fork_branch(user_id: str, data: dict) -> dict:
-    # Verify session ownership
     await get_session(data["session_id"], user_id)
 
     # Validate: first selected message must be from user OR be a compaction summary
@@ -266,7 +261,6 @@ async def fork_branch(user_id: str, data: dict) -> dict:
 
     branch_id = f"branch_{uuid4()}"
 
-    # Duplicate selected messages into the new branch with new IDs
     messages_table = get_table(settings.dynamo_messages_table)
     new_msg_ids = []
     for msg_id in selected_msg_ids:
@@ -290,7 +284,6 @@ async def fork_branch(user_id: str, data: dict) -> dict:
             messages_table.put_item(Item=duplicated_msg)
             new_msg_ids.append(new_msg_id)
 
-    # Create the branch with the new message IDs
     item = {
         "branchId":       branch_id,
         "sessionId":      data["session_id"],
@@ -307,10 +300,8 @@ async def fork_branch(user_id: str, data: dict) -> dict:
 
 
 async def cherry_pick_messages(branch_id: str, user_id: str, source_msg_ids: list[str]) -> dict:
-    # Verify branch ownership
     target_branch = await get_branch(branch_id, user_id)
 
-    # Duplicate each source message into the target branch
     messages_table = get_table(settings.dynamo_messages_table)
     new_msg_ids = []
     duplicated_items = []
@@ -335,7 +326,6 @@ async def cherry_pick_messages(branch_id: str, user_id: str, source_msg_ids: lis
             new_msg_ids.append(new_msg_id)
             duplicated_items.append(duplicated_msg)
 
-    # Append new message IDs to the target branch's selectedMsgIds
     branches_table = get_table(settings.dynamo_branches_table)
     branches_table.update_item(
         Key={"branchId": branch_id},
@@ -343,11 +333,9 @@ async def cherry_pick_messages(branch_id: str, user_id: str, source_msg_ids: lis
         ExpressionAttributeValues={":new_ids": new_msg_ids},
     )
 
-    # Fetch the updated branch
     response = branches_table.get_item(Key={"branchId": branch_id})
     updated_branch = db_to_branch(response["Item"])
 
-    # Convert duplicated messages to API format
     new_messages = [db_to_message(item) for item in duplicated_items]
 
     return {
@@ -421,8 +409,6 @@ def _summarize_gemini(model: str, api_key: str, messages: list) -> tuple[str, in
 async def _validate_compact_request(
     branches_table, messages_table, branch_id: str, user_id: str, msg_ids: list[str]
 ) -> tuple[dict, list[dict]]:
-    """Verify ownership, validate msg_ids belong to the branch, fetch + sort the messages.
-    Returns (branch_item, sorted msg_items)."""
     branch_resp = branches_table.get_item(Key={"branchId": branch_id})
     branch_item = branch_resp.get("Item")
     if not branch_item:
@@ -467,7 +453,6 @@ def _build_summary_item(
     summary_text: str, name: str, msg_ids: list[str],
     tokens_before: int, tokens_after: int,
 ) -> dict:
-    """Construct the DynamoDB item for the compaction-summary message."""
     now = now_iso()
     return {
         "msgId":          f"msg_{uuid4()}",
@@ -488,7 +473,6 @@ def _build_summary_item(
 
 
 def _mark_originals_as_compacted(messages_table, msg_ids: list[str], compacted_by: dict) -> None:
-    """Set state=compacted and attach compactedBy metadata on each original message."""
     now = now_iso()
     for msg_id in msg_ids:
         messages_table.update_item(
@@ -510,20 +494,25 @@ def _summarize(
         return _summarize_anthropic(model, api_key, converse_messages)
     if provider == "gemini" and model and api_key:
         return _summarize_gemini(model, api_key, converse_messages)
-    # Default: Bedrock Nova Lite
+    # Default: Bedrock Nova Pro
     bedrock      = boto3.client("bedrock-runtime", region_name=settings.aws_region)
     bedrock_resp = bedrock.converse(
-        modelId="amazon.nova-lite-v1:0",
+        modelId="us.amazon.nova-pro-v1:0",
         system=[{"text": _COMPACT_SYSTEM_PROMPT}],
         messages=converse_messages,
-        inferenceConfig={"maxTokens": 512},
+        inferenceConfig={"maxTokens": 1024},
     )
+    stop_reason    = bedrock_resp.get("stopReason", "unknown")
     content_blocks = bedrock_resp["output"]["message"]["content"]
-    return (content_blocks[0]["text"] if content_blocks else ""), bedrock_resp["usage"]["outputTokens"]
+    if not content_blocks:
+        raise ValueError(f"Bedrock returned no content blocks (stopReason={stop_reason!r})")
+    text = content_blocks[0].get("text") or ""
+    if not text:
+        raise ValueError(f"Bedrock content block has empty text (stopReason={stop_reason!r})")
+    return text, bedrock_resp["usage"]["outputTokens"]
 
 
 def _splice_branch_ids(ids: list[str], old_ids: list[str], new_ids: list[str], error_detail: str) -> list[str]:
-    """Replace old_ids with new_ids in ids, preserving the position of the first old_id."""
     old_set    = set(old_ids)
     insert_idx = next((i for i, mid in enumerate(ids) if mid in old_set), None)
     if insert_idx is None:
@@ -549,12 +538,14 @@ async def compact_messages(
 
     tokens_before = sum(len(m.get("content") or "") for m in msg_items) // 4
 
-    # Build messages in Bedrock/Anthropic format (role + content array)
     converse_messages = [
         {"role": m["role"], "content": [{"text": m.get("content") or ""}]}
         for m in msg_items
         if m.get("content")
     ]
+
+    if not converse_messages:
+        raise HTTPException(status_code=400, detail="No messages with content to compact")
 
     try:
         summary_text, tokens_after = _summarize(converse_messages, provider, model, api_key)
@@ -578,7 +569,6 @@ async def compact_messages(
     )
     messages_table.put_item(Item=summary_item)
 
-    # Replace compacted IDs with summary ID in selectedMsgIds (preserving order)
     selected_msg_ids = branch_item.get("selectedMsgIds", [])
     new_selected = _splice_branch_ids(
         selected_msg_ids, msg_ids, [summary_item["msgId"]], "Messages not found in branch"
@@ -590,6 +580,7 @@ async def compact_messages(
     )
 
     compacted_by = {"summaryMsgId": summary_item["msgId"], "name": name}
+
     _mark_originals_as_compacted(messages_table, msg_ids, compacted_by)
 
     return {
@@ -603,14 +594,12 @@ async def delete_compaction(branch_id: str, summary_msg_id: str, user_id: str) -
     branches_table = get_table(settings.dynamo_branches_table)
     messages_table = get_table(settings.dynamo_messages_table)
 
-    # Verify branch ownership
     branch_resp = branches_table.get_item(Key={"branchId": branch_id})
     branch_item = branch_resp.get("Item")
     if not branch_item:
         raise HTTPException(status_code=404, detail="Branch not found")
     await get_session(branch_item["sessionId"], user_id)
 
-    # Fetch and validate the summary message
     summary_resp = messages_table.get_item(Key={"msgId": summary_msg_id})
     summary = summary_resp.get("Item")
     if not summary:
@@ -622,7 +611,6 @@ async def delete_compaction(branch_id: str, summary_msg_id: str, user_id: str) -
 
     original_msg_ids = summary.get("originalMsgIds", [])
 
-    # Replace summary ID with original IDs in selectedMsgIds (preserving position)
     selected = branch_item.get("selectedMsgIds", [])
     new_selected = _splice_branch_ids(
         selected, [summary_msg_id], original_msg_ids, "Summary not found in branch selectedMsgIds"
@@ -633,7 +621,6 @@ async def delete_compaction(branch_id: str, summary_msg_id: str, user_id: str) -
         ExpressionAttributeValues={":new_ids": new_selected},
     )
 
-    # Restore each original message to active state and remove compactedBy
     now = now_iso()
     restored_items = []
     for msg_id in original_msg_ids:
@@ -647,7 +634,6 @@ async def delete_compaction(branch_id: str, summary_msg_id: str, user_id: str) -
         if "Attributes" in resp:
             restored_items.append(resp["Attributes"])
 
-    # Soft-delete the summary message
     messages_table.update_item(
         Key={"msgId": summary_msg_id},
         UpdateExpression="SET #st = :deleted, updatedAt = :now",
@@ -752,8 +738,6 @@ async def delete_message(msg_id: str, user_id: str):
 
 MODEL_COSTS: dict[str, tuple[float, float]] = {
     # (input_rate, output_rate) per 1K tokens
-    "amazon.nova-micro-v1:0":    (0.000035,  0.00014),
-    "amazon.nova-lite-v1:0":     (0.00006,   0.00024),
     "us.amazon.nova-pro-v1:0":   (0.0008,    0.0032),
     "claude-haiku-4-5-20251001": (0.0008,    0.004),
     "claude-sonnet-4-5":         (0.003,     0.015),
@@ -761,11 +745,11 @@ MODEL_COSTS: dict[str, tuple[float, float]] = {
     "gemini-2.5-flash":          (0.0000375, 0.00015),
     "gemini-2.5-pro":            (0.00125,   0.005),
 }
-_DEFAULT_COST = (0.000035, 0.00014)  # Nova Micro fallback for unknown models
+_DEFAULT_COST = (0.0008, 0.0032)  # Nova Pro fallback for unknown models
+_MAX_STAT_ITEMS = 5_000
 
 
 async def get_usage_stats(user_id: str) -> dict:
-    """Aggregate token usage for a user across all messages."""
     table = get_table(settings.dynamo_messages_table)
 
     total_input_tokens = 0
@@ -781,19 +765,23 @@ async def get_usage_stats(user_id: str) -> dict:
     kwargs = {
         "IndexName": IDX_USER_CREATED,
         "KeyConditionExpression": Key("userId").eq(user_id),
+        "ScanIndexForward": False,  # newest first so the cap covers recent history
     }
 
+    processed = 0
     while True:
         response = table.query(**kwargs)
-        for item in response.get("Items", []):
+        items = response.get("Items", [])
+        processed += len(items)
+
+        for item in items:
             input_tokens  = int(item.get("inputTokens")  or 0)
             output_tokens = int(item.get("outputTokens") or 0)
 
-            # Skip user messages — they have no token data
             if input_tokens == 0 and output_tokens == 0:
                 continue
 
-            model_id      = item.get("modelId", "amazon.nova-micro-v1:0")
+            model_id      = item.get("modelId", "us.amazon.nova-pro-v1:0")
             created_at    = item.get("createdAt", "")
             date_str      = created_at[:10] if len(created_at) >= 10 else "unknown"
 
@@ -814,7 +802,7 @@ async def get_usage_stats(user_id: str) -> dict:
 
             model_tokens[model_id] = model_tokens.get(model_id, 0) + input_tokens + output_tokens
 
-        if "LastEvaluatedKey" not in response:
+        if "LastEvaluatedKey" not in response or processed >= _MAX_STAT_ITEMS:
             break
         kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 

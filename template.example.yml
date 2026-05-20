@@ -70,3 +70,16 @@ Resources:
       Tracing: PassThrough
       Role: >-
         arn:aws:iam::ACCOUNT:role/service-role/ROLE_NAME
+
+  BedrockPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: fast-api-lambda-bedrock-policy
+      Roles:
+        - ROLE_NAME
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/us.amazon.nova-pro-v1:0"

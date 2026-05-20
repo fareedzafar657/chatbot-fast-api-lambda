@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Optional, Literal, Generic, TypeVar
 
 T = TypeVar('T')
@@ -36,7 +36,7 @@ class Message(BaseModel):
 
 class PatchMessageRequest(BaseModel):
     state:   Optional[MessageState] = None
-    content: Optional[str] = Field(None, max_length=100_000)  # only used when state = edited
+    content: Optional[str] = Field(None, max_length=100_000)
 
     @model_validator(mode="after")
     def at_least_one_field(self):
@@ -165,12 +165,16 @@ class DailyUsage(BaseModel):
 
 
 class ModelBreakdown(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     model_id:    str
     token_count: int
     percentage:  int
 
 
 class UsageStats(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     total_messages:      int
     total_input_tokens:  int
     total_output_tokens: int
