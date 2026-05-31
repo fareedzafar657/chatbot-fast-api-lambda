@@ -13,17 +13,6 @@ class Settings(BaseSettings):
     cognito_client_id: str = Field(
         description="Cognito client ID (required for token validation)"
     )
-    cognito_region: str = Field(default="us-east-1")
-
-    dynamo_messages_table: str = Field(default="chatbot_messages")
-    dynamo_branches_table: str = Field(default="chatbot_branches")
-    dynamo_sessions_table: str = Field(default="chatbot_sessions")
-
-    # CORS — set to your frontend domain in production
-    cors_origins: str = Field(
-        default="http://localhost:3000",
-        description="Comma-separated list of allowed origins"
-    )
 
     class Config:
         env_file = ".env"
@@ -31,7 +20,8 @@ class Settings(BaseSettings):
     @field_validator("cognito_user_pool_id")
     @classmethod
     def validate_cognito_pool_id(cls, v: str) -> str:
-        if not v or not v.strip():
+        v = v.strip() if v else v
+        if not v:
             raise ValueError(
                 "COGNITO_USER_POOL_ID is required and cannot be empty. "
                 "Set it in your .env or Lambda environment variables."
@@ -41,41 +31,29 @@ class Settings(BaseSettings):
                 f"COGNITO_USER_POOL_ID looks invalid: {v}. "
                 f"Expected format like 'us-east-1_XXXXXXXXX'"
             )
-        return v.strip()
+        return v
 
     @field_validator("cognito_client_id")
     @classmethod
     def validate_cognito_client_id(cls, v: str) -> str:
-        if not v or not v.strip():
+        v = v.strip() if v else v
+        if not v:
             raise ValueError(
                 "COGNITO_CLIENT_ID is required and cannot be empty. "
                 "Set it in your .env or Lambda environment variables."
             )
-        return v.strip()
-
-    @field_validator("cors_origins")
-    @classmethod
-    def validate_cors_origins(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("CORS_ORIGINS cannot be empty")
-        origins = [o.strip() for o in v.split(",") if o.strip()]
-        if not origins:
-            raise ValueError("CORS_ORIGINS must contain at least one valid origin")
-        for origin in origins:
-            if not origin.startswith(("http://", "https://")):
-                raise ValueError(
-                    f"Invalid CORS origin: {origin}. Must start with http:// or https://"
-                )
         return v
 
+    demo_models_allowed_emails: str = Field(default="")
+
     @property
-    def cors_origins_list(self) -> list[str]:
-        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+    def demo_allowed_emails(self) -> list[str]:
+        return [e.strip() for e in self.demo_models_allowed_emails.split(",") if e.strip()]
 
     @property
     def cognito_jwks_url(self) -> str:
         return (
-            f"https://cognito-idp.{self.cognito_region}.amazonaws.com"
+            f"https://cognito-idp.{self.aws_region}.amazonaws.com"
             f"/{self.cognito_user_pool_id}/.well-known/jwks.json"
         )
 

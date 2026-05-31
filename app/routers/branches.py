@@ -1,7 +1,11 @@
 from fastapi import APIRouter, Depends
-from app.middleware.auth import get_current_user
-from app.models.schemas import Branch, ForkBranchRequest, CherryPickRequest, CherryPickResponse, CompactRequest, CompactResponse, DeleteCompactionResponse, SuccessResponse
-from app.services import dynamodb as db
+from app.middleware.auth import get_current_user, extract_email_from_id_token
+from app.models.schemas import (
+    Branch, ForkBranchRequest, CherryPickRequest, CherryPickResponse,
+    CompactRequest, CompactResponse, DeleteCompactionResponse
+)
+from app.services import db_branches as db
+from app.services import db_compaction
 
 router = APIRouter(prefix="/branches", tags=["Branches"])
 
@@ -23,7 +27,7 @@ async def get_branch(
     branch_id: str,
     user: dict = Depends(get_current_user),
 ):
-    """Get a single branch including its selectedMsgIds."""
+    """Get a single branch."""
     return await db.get_branch(branch_id, user["sub"])
 
 
@@ -33,10 +37,8 @@ async def fork_branch(
     user: dict = Depends(get_current_user),
 ):
     """
-    Create a new branch from a custom selection of messages.
-
-    The caller passes selectedMsgIds — the ordered list of messages
-    that will be fed to Bedrock on the next prompt in this branch.
+    Create a new branch by duplicating the caller-supplied selected_msg_ids.
+    Each selected message is copied with a new msgId and the new branchId.
     The original branch is preserved intact.
     """
     return await db.fork_branch(
@@ -64,13 +66,15 @@ async def compact_branch(
     branch_id: str,
     body: CompactRequest,
     user: dict = Depends(get_current_user),
+    user_email: str | None = Depends(extract_email_from_id_token),
 ):
     """Replace selected messages with an AI-generated summary to free context tokens."""
-    return await db.compact_messages(
+    return await db_compaction.compact_messages(
         branch_id=branch_id,
         user_id=user["sub"],
         msg_ids=body.msg_ids,
         name=body.name,
+        user_email=user_email,
         provider=body.provider,
         model=body.model,
         api_key=body.api_key,
@@ -84,7 +88,7 @@ async def delete_compaction(
     user: dict = Depends(get_current_user),
 ):
     """Revert a compaction: restore original messages to active and remove the summary."""
-    return await db.delete_compaction(
+    return await db_compaction.delete_compaction(
         branch_id=branch_id,
         summary_msg_id=summary_msg_id,
         user_id=user["sub"],

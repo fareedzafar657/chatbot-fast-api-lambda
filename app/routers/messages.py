@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, Query
 from app.middleware.auth import get_current_user
 from app.models.schemas import (
-    Message, PaginatedMessages, PatchMessageRequest, SuccessResponse
+    Message, PaginatedMessages, PatchMessageRequest
 )
-from app.services import dynamodb as db
+from app.services import db_messages as db
 
 router = APIRouter(prefix="/messages", tags=["Messages"])
 
@@ -25,23 +25,13 @@ async def list_messages(
     The next_cursor in the response is passed back as cursor on the next call.
     has_more=false means you've reached the end.
     """
-    result = await db.list_messages(
+    return await db.list_messages(
         branch_id=branch_id,
         user_id=user["sub"],
         page_size=page_size,
         cursor=cursor,
         include_deleted=include_deleted,
     )
-    return result
-
-
-@router.get("/{msg_id}", response_model=Message)
-async def get_message(
-    msg_id: str,
-    user: dict = Depends(get_current_user),
-):
-    """Get a single message by ID."""
-    return await db.get_message(msg_id, user["sub"])
 
 
 @router.patch("/{msg_id}", response_model=Message)
@@ -67,13 +57,3 @@ async def patch_message(
         state=body.state,
         content=body.content,
     )
-
-
-@router.delete("/{msg_id}", response_model=SuccessResponse)
-async def delete_message(
-    msg_id: str,
-    user: dict = Depends(get_current_user),
-):
-    """Soft-delete a message (sets state=deleted, preserves the record)."""
-    await db.delete_message(msg_id, user["sub"])
-    return SuccessResponse(message="Message deleted")

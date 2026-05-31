@@ -3,17 +3,20 @@ from app.middleware.auth import get_current_user
 from app.models.schemas import (
     Session, PaginatedSessions, UpdateSessionRequest, SuccessResponse, UsageStats
 )
-from app.services import dynamodb as db
+from app.services import db_sessions as db
+from app.services import db_messages
 
 router = APIRouter(prefix="/sessions", tags=["Sessions"])
 
 
+# Must be declared before GET /{session_id} — FastAPI matches by order,
+# otherwise "usage" would bind to the session_id path param.
 @router.get("/usage/stats", response_model=UsageStats)
 async def get_usage_stats(
     user: dict = Depends(get_current_user),
 ):
     """Return aggregated token usage for the current user."""
-    return await db.get_usage_stats(user["sub"])
+    return await db_messages.get_usage_stats(user["sub"])
 
 
 @router.get("", response_model=PaginatedSessions)
@@ -23,12 +26,11 @@ async def list_sessions(
     user: dict = Depends(get_current_user),
 ):
     """List all sessions for the current user, most recently active first."""
-    result = await db.list_sessions(
+    return await db.list_sessions(
         user_id=user["sub"],
         page_size=page_size,
         cursor=cursor,
     )
-    return result
 
 
 @router.get("/{session_id}", response_model=Session)

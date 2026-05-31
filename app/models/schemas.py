@@ -10,6 +10,22 @@ MessageRole  = Literal["user", "assistant"]
 MessageState = Literal["active", "stopped", "edited", "deleted", "compacted"]
 
 
+# ─── Compaction ──────────────────────────────────────────────────────────────
+
+class CompactedBy(BaseModel):
+    """Set on compacted originals — points back to the summary message."""
+    summary_msg_id: str
+    name:           str
+
+
+class CompactionSummary(BaseModel):
+    """Set on the summary message — metadata about what was compacted."""
+    name:             str
+    original_msg_ids: list[str]
+    tokens_before:    int
+    tokens_after:     int
+
+
 # ─── Message ─────────────────────────────────────────────────────────────────
 
 class Message(BaseModel):
@@ -25,13 +41,10 @@ class Message(BaseModel):
     output_tokens: Optional[int] = None
     created_at:   str
     updated_at:   str
-    # Compaction fields — present only on compaction-summary messages and their originals
-    type:              Optional[Literal["compaction-summary"]] = None
-    compaction_name:   Optional[str] = None
-    original_msg_ids:  Optional[list[str]] = None
-    tokens_before:     Optional[int] = None
-    tokens_after:      Optional[int] = None
-    compacted_by:      Optional[dict] = None
+    # Discriminator + per-role compaction metadata
+    type:         Optional[Literal["compaction-summary"]] = None
+    compaction:   Optional[CompactionSummary] = None   # set when type == "compaction-summary"
+    compacted_by: Optional[CompactedBy]       = None   # set when state == "compacted"
 
 
 class PatchMessageRequest(BaseModel):
@@ -63,7 +76,6 @@ class Branch(BaseModel):
     session_id:       str
     parent_branch_id: Optional[str] = None
     parent_msg_id:    Optional[str] = None
-    selected_msg_ids: list[str] = []
     label:            str
     created_at:       str
 
@@ -84,10 +96,6 @@ class ForkBranchRequest(BaseModel):
             "label": "without that tangent"
         }]
     }}
-
-
-class UpdateActiveBranchRequest(BaseModel):
-    branch_id: str
 
 
 class CherryPickRequest(BaseModel):
@@ -145,7 +153,6 @@ class UpdateSessionRequest(BaseModel):
 class PaginatedResponse(BaseModel, Generic[T]):
     items:       list[T]
     count:       int
-    page:        int
     page_size:   int
     has_more:    bool
     next_cursor: Optional[str] = None   # base64-encoded LastEvaluatedKey
@@ -182,6 +189,7 @@ class UsageStats(BaseModel):
     estimated_cost_usd:  float
     daily_usage:         list[DailyUsage]
     model_breakdown:     list[ModelBreakdown]
+    truncated:           bool = False
 
 
 # ─── Generic responses ────────────────────────────────────────────────────────

@@ -14,7 +14,7 @@
 - **Session management** — create, list, update, and delete chat sessions with cursor-based pagination
 - **Branching conversations** — fork branches from any message, reconstruct the conversation tree on the frontend
 - **Cherry-pick** — copy individual messages from any branch into the current one
-- **Context compaction** — summarise selected messages using Anthropic, Google Gemini, or AWS Bedrock (Nova Pro); revert compactions at any time
+- **Context compaction** — summarise selected messages using Anthropic, Google Gemini, or AWS Bedrock; revert compactions at any time
 - **Message state machine** — messages move through `active → stopped / edited / deleted / compacted` states; soft deletes preserve history
 - **Usage stats** — per-user token aggregation with daily breakdown and per-model cost estimates
 - **Cognito JWT auth** — JWKS-based RS256 verification with in-process key caching (1 h TTL)
@@ -87,12 +87,7 @@ COGNITO_USER_POOL_ID=us-east-1_XXXXXXXXX
 COGNITO_CLIENT_ID=your-app-client-id
 
 # Optional — defaults shown
-COGNITO_REGION=us-east-1
 AWS_REGION=us-east-1
-CORS_ORIGINS=http://localhost:3000
-DYNAMO_SESSIONS_TABLE=chatbot_sessions
-DYNAMO_BRANCHES_TABLE=chatbot_branches
-DYNAMO_MESSAGES_TABLE=chatbot_messages
 ```
 
 ### 4. Run the development server
@@ -118,7 +113,7 @@ app/
 ├── main.py                ← FastAPI app, CORS, request logging, global error handler
 ├── config.py              ← Pydantic-settings config (validated at startup)
 ├── middleware/
-│   └── auth.py            ← Cognito JWKS fetch + RS256 JWT verification
+│   └── auth.py            ← Cognito JWKS fetch + RS256 JWT verification + ID-token email extraction
 ├── models/
 │   └── schemas.py         ← All Pydantic request/response models
 ├── routers/
@@ -126,7 +121,11 @@ app/
 │   ├── branches.py        ← /branches endpoints
 │   └── messages.py        ← /messages endpoints
 └── services/
-    └── dynamodb.py        ← All DynamoDB reads/writes + AI summarization
+    ├── db_base.py         ← DynamoDB client, table/GSI constants, shared helpers, db→dict converters
+    ├── db_sessions.py     ← Session CRUD
+    ├── db_branches.py     ← Branch CRUD, fork, cherry-pick
+    ├── db_messages.py     ← Message CRUD, usage stats
+    └── db_compaction.py   ← Context compaction (AI summarization) and revert
 ```
 
 ---
@@ -137,14 +136,10 @@ app/
 |---|---|---|---|
 | `COGNITO_USER_POOL_ID` | Yes | — | Format: `us-east-1_XXXXXXXXX` |
 | `COGNITO_CLIENT_ID` | Yes | — | Cognito App Client ID |
-| `COGNITO_REGION` | No | `us-east-1` | Region of the User Pool |
-| `AWS_REGION` | No | `us-east-1` | Region for DynamoDB and Bedrock |
-| `CORS_ORIGINS` | No | `http://localhost:3000` | Comma-separated list of allowed origins |
-| `DYNAMO_SESSIONS_TABLE` | No | `chatbot_sessions` | DynamoDB table name |
-| `DYNAMO_BRANCHES_TABLE` | No | `chatbot_branches` | DynamoDB table name |
-| `DYNAMO_MESSAGES_TABLE` | No | `chatbot_messages` | DynamoDB table name |
+| `AWS_REGION` | No | `us-east-1` | Region for DynamoDB, Bedrock, and Cognito |
+| `DEMO_MODELS_ALLOWED_EMAILS` | No | `""` | Comma-separated emails permitted to use non-default Bedrock models for compaction |
 
-All variables are validated at startup — the process will refuse to start with a clear error message if required values are missing or malformed.
+Required variables are validated at startup — the process will refuse to start with a clear error message if they are missing or malformed.
 
 ---
 
@@ -221,10 +216,8 @@ All endpoints (except `/health`) require a `Bearer` token from AWS Cognito in th
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/messages/branch/{branch_id}` | List messages in a branch (paginated) |
-| `GET` | `/messages/{msg_id}` | Get a message by ID |
+| `GET` | `/messages/branch/{branch_id}` | List messages in a branch (paginated); pass `include_deleted=true` to include soft-deleted messages |
 | `PATCH` | `/messages/{msg_id}` | Update state and/or content |
-| `DELETE` | `/messages/{msg_id}` | Soft delete (sets `state=deleted`, preserves the record) |
 
 ### Health
 
@@ -286,13 +279,16 @@ Pass `next_cursor` back as `cursor` on the next call. `has_more: false` means yo
 }
 ```
 
-| `provider` | Model field | Key field | Notes |
+| `provider` | `model` | `api_key` | Notes |
 |---|---|---|---|
 | `"anthropic"` | Any Claude model ID | Anthropic API key | Calls `api.anthropic.com` |
 | `"gemini"` | Any Gemini model ID | Google AI API key | Calls `generativelanguage.googleapis.com` |
-| omitted | — | — | Falls back to **AWS Bedrock Nova Pro** (no key needed) |
+| omitted | omitted | — | AWS Bedrock **Nova Pro** (default, no key needed) |
+| omitted | A Bedrock model ID | — | AWS Bedrock with a specific model — only permitted for emails listed in `DEMO_MODELS_ALLOWED_EMAILS`; requires `X-Id-Token` header (Cognito ID token) for email verification |
 
 The compacted originals move to `state=compacted`. Use `DELETE /branches/{branch_id}/compact/{summary_msg_id}` to revert and restore them.
+
+> **Note:** when forking a branch that contains a compaction summary, the duplicate summary's `originalMsgIds` is cleared so that deleting the copy does not affect the original branch's compacted messages.
 
 ### Branch Forking
 
@@ -326,15 +322,6 @@ Required GitHub Secrets:
 | `AWS_ACCESS_KEY_ID` | IAM key with `lambda:UpdateFunctionCode` permission |
 | `AWS_SECRET_ACCESS_KEY` | Corresponding secret |
 
-### Manual deployment
-
-```bash
-bash app/deploy.sh <function-name> <region>
-
-# Example:
-bash app/deploy.sh chatbot-api us-east-1
-```
-
 ### Lambda configuration checklist
 
 - **Runtime:** Python 3.12
@@ -343,7 +330,7 @@ bash app/deploy.sh chatbot-api us-east-1
 - **Timeout:** 60 s
 - **Architecture:** x86\_64
 - **Environment variables:** set all required vars (see [Environment Variables](#environment-variables))
-- **IAM role:** must have `dynamodb:*` on the three tables and `bedrock:InvokeModel` on Nova Pro if using the default compaction provider
+- **IAM role:** must have `dynamodb:*` on the three tables and `bedrock:InvokeModel` on any Bedrock model IDs you intend to use for compaction (at minimum Nova Pro)
 
 ---
 
@@ -355,22 +342,7 @@ This service is one of three components that make up K-AI:
 |---|---|---|
 | Frontend | [k-ai](https://github.com/fareedzafar657/k-ai) | Next.js chat UI |
 | REST API | **this repo** | Sessions, branches, messages, usage stats |
-| Streaming Lambda | [chatbot-streaming-lambda](https://github.com/fareedzafar657/chatbot-streaming-lambda) | Real-time token streaming via SSE |
-
----
-
-## Contributing
-
-1. Fork and create a feature branch: `git checkout -b feature/my-feature`
-2. Keep PRs focused — one feature or fix per PR
-3. Open an issue first for significant changes
-
-Before submitting:
-
-```bash
-python -m py_compile lambda_handler.py
-find app -name "*.py" -exec python -m py_compile {} \;
-```
+| Streaming Lambda | [chatbot-streaming-lambda](https://github.com/fareedzafar657/chatbot-streaming-lambda) | Real-time token streaming (NDJSON over Lambda Function URL response streaming) |
 
 ---
 

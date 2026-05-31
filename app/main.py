@@ -1,14 +1,24 @@
+"""FastAPI app wiring — routers, middleware, error handler, Lambda export.
+
+Business logic lives in app/services/, schemas in app/models/, JWT auth in
+app/middleware/. This file should never grow domain logic.
+
+Local CORS is mounted only when running outside Lambda; on Lambda the
+Function URL configuration handles CORS.
+"""
+
 import logging
+import os
 import time
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 
-from app.config import get_settings
 from app.routers import sessions, branches, messages
 
-settings = get_settings()
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─── App ─────────────────────────────────────────────────────────────────────
@@ -19,15 +29,17 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# ─── CORS ────────────────────────────────────────────────────────────────────
+# ─── Local CORS ──────────────────────────────────────────────────────────────
+# Only active when running locally — on Lambda the Function URL handles CORS.
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins_list,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
+if not os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # ─── Request Logging ──────────────────────────────────────────────────────────
 
@@ -64,6 +76,9 @@ async def health():
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    if isinstance(exc, HTTPException):
+        return await http_exception_handler(request, exc)
+
     logger.error(
         "Unhandled exception",
         exc_info=True,
