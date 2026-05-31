@@ -64,7 +64,11 @@ jobs:
           python -m py_compile app/routers/sessions.py
           python -m py_compile app/routers/branches.py
           python -m py_compile app/routers/messages.py
-          python -m py_compile app/services/dynamodb.py
+          python -m py_compile app/services/db_base.py
+          python -m py_compile app/services/db_sessions.py
+          python -m py_compile app/services/db_branches.py
+          python -m py_compile app/services/db_messages.py
+          python -m py_compile app/services/db_compaction.py
           python -m py_compile app/middleware/auth.py
           python -m py_compile app/models/schemas.py
           echo "All modules compile successfully ✓"
