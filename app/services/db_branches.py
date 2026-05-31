@@ -1,5 +1,5 @@
 """Branch CRUD, fork, and cherry-pick."""
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from boto3.dynamodb.conditions import Key
 from fastapi import HTTPException, status
@@ -71,16 +71,17 @@ def _duplicate_messages(
     if verify_ownership and any(m.get("userId") != user_id for m in fetched.values()):
         raise HTTPException(status_code=403, detail="Access denied to source message")
 
-    now = now_iso()
+    # Per-copy createdAt (base + index µs) — a shared timestamp sorts equal, shuffling the branch.
+    base = datetime.now(timezone.utc)
     duplicated_items = []
     with messages_table.batch_writer() as batch:
-        for msg_id in msg_ids:
+        for i, msg_id in enumerate(msg_ids):
             original = fetched[msg_id]
             duplicated = {
                 **original,
                 "msgId":     f"msg_{uuid4()}",
                 "branchId":  target_branch_id,
-                "createdAt": now,
+                "createdAt": (base + timedelta(microseconds=i)).isoformat(),
             }
             duplicated.pop("inputTokens",  None)
             duplicated.pop("outputTokens", None)

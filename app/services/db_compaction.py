@@ -291,13 +291,18 @@ async def delete_compaction(branch_id: str, summary_msg_id: str, user_id: str) -
     if summary.get("branchId") != branch_id:
         raise HTTPException(status_code=400, detail="Message does not belong to this branch")
 
-    original_msg_ids = summary.get("originalMsgIds", [])
+    # Dedupe + drop the summary's own id — TransactWriteItems rejects two ops on one key.
+    original_msg_ids = list(dict.fromkeys(
+        mid for mid in summary.get("originalMsgIds", []) if mid != summary_msg_id
+    ))
     now = now_iso()
 
     # Restore originals via TransactWriteItems (atomic, max 100 items per transaction).
     # We chunk to 99 originals + 1 summary-delete in the final batch.
     # If a later batch fails, earlier batches stay restored — operator must reconcile.
-    client     = get_dynamodb().meta.client
+    # Low-level client, not get_dynamodb().meta.client — the resource client re-marshals our
+    # already-serialized keys into {"S": {"S": ...}} → "key element does not match the schema".
+    client     = boto3.client("dynamodb", region_name=settings.aws_region)
     serializer = TypeSerializer()
     BATCH = 99
 
