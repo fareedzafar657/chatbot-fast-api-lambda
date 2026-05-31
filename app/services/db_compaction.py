@@ -41,11 +41,28 @@ def _estimated_tokens(item: dict) -> tuple[int, int]:
 
 # ─── Provider summarizers ────────────────────────────────────────────────────
 
+def _flatten_conversation(messages: list) -> str:
+    """Render the messages as a single transcript. Sending the selection as raw alternating
+    turns ending on an assistant message makes models treat the dialogue as complete (Nova
+    and Gemini return empty; recent Claude rejects the implied prefill with 400). Folding it
+    into one user turn asks for a summary instead of a continuation."""
+    return "\n\n".join(
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][0]['text']}"
+        for m in messages
+    )
+
+
 def _summarize_anthropic(model: str, api_key: str, messages: list) -> tuple[str, int]:
+    conv_text = _flatten_conversation(messages)
     resp = httpx.post(
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
-        json={"model": model, "system": _COMPACT_SYSTEM_PROMPT, "messages": messages, "max_tokens": 512},
+        json={
+            "model": model,
+            "system": _COMPACT_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": conv_text}],
+            "max_tokens": 512,
+        },
         timeout=60,
     )
     resp.raise_for_status()
@@ -71,13 +88,7 @@ def _extract_gemini_text(data: dict) -> str:
 
 
 def _summarize_gemini(model: str, api_key: str, messages: list) -> tuple[str, int]:
-    # Present the conversation as a single user turn rather than multi-turn contents.
-    # When contents ends with a model-role entry, Gemini returns STOP with zero output
-    # because it considers the conversation already complete — it won't continue on its own.
-    conv_text = "\n\n".join(
-        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][0]['text']}"
-        for m in messages
-    )
+    conv_text = _flatten_conversation(messages)
     resp = httpx.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         params={"key": api_key},
@@ -109,20 +120,18 @@ def _summarize(
         return _summarize_gemini(model, api_key, converse_messages)
     # Bedrock — use caller-supplied model if provided, otherwise default to Nova Pro
     bedrock_model = model or _DEFAULT_BEDROCK_MODEL
+    conv_text = _flatten_conversation(converse_messages)
     bedrock      = boto3.client("bedrock-runtime", region_name=settings.aws_region)
     bedrock_resp = bedrock.converse(
         modelId=bedrock_model,
         system=[{"text": _COMPACT_SYSTEM_PROMPT}],
-        messages=converse_messages,
+        messages=[{"role": "user", "content": [{"text": conv_text}]}],
         inferenceConfig={"maxTokens": 1024},
     )
-    stop_reason    = bedrock_resp.get("stopReason", "unknown")
     content_blocks = bedrock_resp["output"]["message"]["content"]
-    if not content_blocks:
-        raise ValueError(f"Bedrock returned no content blocks (stopReason={stop_reason!r})")
-    text = content_blocks[0].get("text") or ""
+    text = content_blocks[0].get("text") or "" if content_blocks else ""
     if not text:
-        raise ValueError(f"Bedrock content block has empty text (stopReason={stop_reason!r})")
+        raise ValueError("Bedrock returned an empty summary")
     return text, bedrock_resp["usage"]["outputTokens"]
 
 
