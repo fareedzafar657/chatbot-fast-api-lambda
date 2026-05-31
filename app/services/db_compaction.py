@@ -23,6 +23,10 @@ _COMPACT_SYSTEM_PROMPT = (
     "Be concise but complete."
 )
 
+# Default Bedrock model — always allowed for every user. Only models other than this
+# require the caller to be on the demo allowlist.
+_DEFAULT_BEDROCK_MODEL = "us.amazon.nova-pro-v1:0"
+
 
 # ─── Token estimation ─────────────────────────────────────────────────────────
 
@@ -104,7 +108,7 @@ def _summarize(
     if provider == "gemini" and model and api_key:
         return _summarize_gemini(model, api_key, converse_messages)
     # Bedrock — use caller-supplied model if provided, otherwise default to Nova Pro
-    bedrock_model = model or "us.amazon.nova-pro-v1:0"
+    bedrock_model = model or _DEFAULT_BEDROCK_MODEL
     bedrock      = boto3.client("bedrock-runtime", region_name=settings.aws_region)
     bedrock_resp = bedrock.converse(
         modelId=bedrock_model,
@@ -203,9 +207,9 @@ async def compact_messages(
     model: str | None = None,
     api_key: str | None = None,
 ) -> dict:
-    # Validate demo-model access: non-default Bedrock models are only allowed for
-    # permitted emails. Anyone else sending a custom model is rejected.
-    if not provider and model:
+    # Validate demo-model access: the default Bedrock model is always allowed. Only a
+    # non-default Bedrock model requires the caller to be on the demo allowlist.
+    if not provider and model and model != _DEFAULT_BEDROCK_MODEL:
         if user_email not in settings.demo_allowed_emails:
             raise HTTPException(status_code=403, detail="Access denied to requested model")
 
