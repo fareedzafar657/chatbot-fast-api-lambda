@@ -38,10 +38,9 @@ async def get_branch(branch_id: str, user_id: str) -> dict:
 def _duplicate_messages(
     msg_ids: list[str],
     target_branch_id: str,
-    user_id: str,
     *,
     restore_compacted: bool,
-    verify_ownership: bool,
+    verify_session: str | None,
 ) -> list[dict]:
     """
     Batch-copy messages into target_branch_id with new msgIds and createdAt.
@@ -50,10 +49,12 @@ def _duplicate_messages(
     restore_compacted=True: copies of state='compacted' become state='active'
     and shed their compactedBy (used by fork — new branch starts fresh).
 
-    verify_ownership=True: every source message's userId must match user_id
-    (used by cherry-pick — caller has not pre-verified source ownership).
+    verify_session set: every source message must belong to that session (used by
+    cherry-pick to confine sources to the owned session). Session ownership itself is
+    verified by the caller; per-message userId isn't checked (assistant messages written
+    by the streaming Lambda carry no userId).
 
-    Raises 400 if any msg_id is missing, 403 on ownership violation.
+    Raises 400 if any msg_id is missing, 403 if a source is outside verify_session.
     """
     if not msg_ids:
         return []
@@ -68,7 +69,7 @@ def _duplicate_messages(
             detail=f"Messages not found: {missing[:5]}",
         )
 
-    if verify_ownership and any(m.get("userId") != user_id for m in fetched.values()):
+    if verify_session and any(m.get("sessionId") != verify_session for m in fetched.values()):
         raise HTTPException(status_code=403, detail="Access denied to source message")
 
     # Per-copy createdAt (base + index µs) — a shared timestamp sorts equal, shuffling the branch.
@@ -117,9 +118,8 @@ async def fork_branch(user_id: str, data: dict) -> dict:
     _duplicate_messages(
         selected_msg_ids,
         branch_id,
-        user_id,
         restore_compacted=True,
-        verify_ownership=False,   # session ownership already verified above
+        verify_session=data["session_id"],   # session ownership verified above; confine sources to it
     )
 
     item = {
@@ -142,9 +142,8 @@ async def cherry_pick_messages(branch_id: str, user_id: str, source_msg_ids: lis
     duplicated_items = _duplicate_messages(
         source_msg_ids,
         branch_id,
-        user_id,
         restore_compacted=False,
-        verify_ownership=True,
+        verify_session=target_branch["session_id"],
     )
 
     return {
